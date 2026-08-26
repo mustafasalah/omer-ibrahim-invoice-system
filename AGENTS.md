@@ -112,3 +112,11 @@ npm run verify
 - **الأمن:** CSRF والجلسات والكوكيز وredaction وعقد الأخطاء لا تكشف أسرارًا.
 - **النطاق:** لا مخزون أو مشتريات أو محاسبة أو POS، ولا ميزة من مرحلة لاحقة بلا طلب.
 - **الاختبارات:** كل قصة مرتبطة باختبار قبول مناسب، مع unit للحساب، integration للذرية والصلاحيات، وE2E للمسار الرأسي.
+
+## Language conventions
+
+- Product requirements and business documentation may remain in Arabic UTF-8.
+- Code, identifiers, database objects, API routes, error codes, filenames, and Git commits must use English.
+- User-facing Arabic text must use centralized i18n translation keys.
+- Do not hardcode Arabic UI strings throughout components.
+- Preserve correct RTL layout and Arabic number/date presentation.
