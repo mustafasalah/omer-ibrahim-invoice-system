@@ -43,6 +43,9 @@ export default async function HomePage() {
           </div>
         </dl>
       </section>
+      {session.user.capabilities.includes("settings.manage") && (
+        <a className="dashboard__settings-link" href="/settings">{messages.settings.title}</a>
+      )}
     </main>
   );
 }

@@ -226,4 +226,24 @@ describe("login and database-backed sessions", () => {
       resolveSessionToken({ connection: temporary.connection, token: inactiveSession.token, now: start }),
     ).toBeUndefined();
   });
+
+  it("applies a changed idle policy only to sessions created after the change", async () => {
+    temporary = createTemporaryDatabase();
+    const start = new Date("2026-08-27T11:00:00.000Z");
+    await createTestAdmin(temporary.connection, { now: start });
+    const original = await login({ connection: temporary.connection,
+      input: { username: "admin.local", password: TEST_ADMIN_PASSWORD }, now: start });
+    temporary.connection.client.prepare(`insert into app_settings
+      (id,company_name_ar,company_name_en,currency_code,currency_symbol_ar,currency_decimals,
+       invoice_number_prefix,invoice_number_pattern,sequence_start,sequence_reset_policy,
+       date_display_format,paper_format,timezone,session_idle_minutes,session_absolute_hours,updated_at)
+      values ('default','شركة','Company','SDG','ج.س',2,'OI','{PREFIX}-{YYYY}-{SEQ:5}',1,'YEARLY',
+       'DD/MM/YYYY','A4','Africa/Khartoum',10,12,?)`).run(start.toISOString());
+    const newer = await login({ connection: temporary.connection,
+      input: { username: "admin.local", password: TEST_ADMIN_PASSWORD }, now: start });
+    expect(resolveSessionToken({ connection: temporary.connection, token: newer.token,
+      now: new Date(start.getTime() + 11 * 60_000) })).toBeUndefined();
+    expect(resolveSessionToken({ connection: temporary.connection, token: original.token,
+      now: new Date(start.getTime() + 11 * 60_000) })).toBeDefined();
+  });
 });

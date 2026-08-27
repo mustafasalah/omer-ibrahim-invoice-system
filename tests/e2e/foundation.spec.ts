@@ -47,6 +47,25 @@ test("setup → administrator → login → protected page → logout", async ({
   }));
   expect(browserStorage).toEqual({ local: [], session: [] });
 
+  await page.getByRole("link", { name: "الإعدادات الأساسية" }).click();
+  await expect(page).toHaveURL(/\/settings$/);
+  await expect(page.getByRole("heading", { name: "الإعدادات الأساسية" })).toBeVisible();
+  const prefixInput = page.getByLabel("بادئة الرقم");
+  await prefixInput.focus();
+  await page.keyboard.press("Tab");
+  await expect(page.getByLabel("نمط الرقم")).toBeFocused();
+  await prefixInput.fill("MED");
+  await expect(page.getByText(/MED-\d{4}-00001/u)).toBeVisible();
+  await page.getByLabel("العنوان").fill("الخرطوم");
+  await page.getByRole("button", { name: "حفظ الإعدادات" }).click();
+  await expect(page.getByRole("status")).toContainText("تم حفظ الإعدادات");
+  await page.reload();
+  await expect(page.getByLabel("العنوان")).toHaveValue("الخرطوم");
+  await page.evaluate(() => { document.documentElement.style.zoom = "2"; });
+  await expect(page.getByRole("button", { name: "حفظ الإعدادات" })).toBeVisible();
+  await page.evaluate(() => { document.documentElement.style.zoom = "1"; });
+  await page.getByRole("link", { name: "العودة إلى لوحة التحكم" }).click();
+
   await page.getByRole("button", { name: "تسجيل الخروج", exact: true }).click();
   await expect(page).toHaveURL(/\/login$/);
   const signedOutSession = await page.request.get("/api/auth/session");

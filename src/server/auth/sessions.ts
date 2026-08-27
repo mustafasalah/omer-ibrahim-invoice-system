@@ -5,6 +5,7 @@ import { ulid } from "ulid";
 import type { Capability, Role } from "@/domain/auth/capabilities";
 import { getCapabilitiesForRole, roleHasCapability } from "@/domain/auth/capabilities";
 import type { SessionUser } from "@/domain/auth/contracts";
+import { SESSION_ABSOLUTE_HOURS } from "@/domain/settings/contracts";
 import { getConfig } from "@/server/config/env";
 import { getDatabase, type DatabaseConnection } from "@/server/db/connection";
 import { withImmediateTransaction } from "@/server/db/transaction";
@@ -12,7 +13,7 @@ import { forbiddenError, unauthorizedError } from "@/server/http/errors";
 import { readCookie, SESSION_COOKIE_NAME } from "./cookies";
 
 export const SESSION_IDLE_MINUTES = 30;
-export const SESSION_ABSOLUTE_HOURS = 12;
+export { SESSION_ABSOLUTE_HOURS };
 export const SESSION_TOUCH_INTERVAL_MS = 5 * 60 * 1_000;
 
 type SessionRow = {
@@ -110,8 +111,14 @@ export function insertSession(options: {
   clientLabel?: string | null;
 }): CreatedSession {
   const createdAt = options.now.toISOString();
+  const storedPolicy = options.connection.client
+    .prepare("select session_idle_minutes as idleMinutes from app_settings where id = 'default'")
+    .get() as { idleMinutes: bigint } | undefined;
+  const idleMinutes = storedPolicy && storedPolicy.idleMinutes >= 5n && storedPolicy.idleMinutes <= 1440n
+    ? Number(storedPolicy.idleMinutes)
+    : SESSION_IDLE_MINUTES;
   const expiresAt = new Date(
-    options.now.getTime() + SESSION_IDLE_MINUTES * 60 * 1_000,
+    options.now.getTime() + idleMinutes * 60 * 1_000,
   ).toISOString();
   const absoluteExpiresAt = new Date(
     options.now.getTime() + SESSION_ABSOLUTE_HOURS * 60 * 60 * 1_000,
@@ -182,8 +189,14 @@ export function resolveSessionToken(options: {
   }
 
   if (nowMs - lastSeenAtMs >= SESSION_TOUCH_INTERVAL_MS) {
+    // The interval encoded in the session row is the policy captured at login.
+    // Reading it back keeps later setting changes from shortening existing sessions.
+    const capturedIdleMs = Math.min(
+      1440 * 60 * 1_000,
+      Math.max(5 * 60 * 1_000, expiresAtMs - lastSeenAtMs),
+    );
     const nextExpiresAt = new Date(
-      Math.min(nowMs + SESSION_IDLE_MINUTES * 60 * 1_000, absoluteExpiresAtMs),
+      Math.min(nowMs + capturedIdleMs, absoluteExpiresAtMs),
     ).toISOString();
 
     withImmediateTransaction(connection.client, () => {
