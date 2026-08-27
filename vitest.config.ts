@@ -1,7 +1,9 @@
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { defineConfig } from "vitest/config";
 
 const root = path.resolve(import.meta.dirname);
+const testRuntimeDirectory = path.join(tmpdir(), `oims-vitest-runtime-${process.pid}`);
 
 export default defineConfig({
   resolve: {
@@ -12,6 +14,10 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    env: {
+      APP_DATA_DIR: testRuntimeDirectory,
+      NODE_ENV: "test",
+    },
     passWithNoTests: false,
     projects: [
       {

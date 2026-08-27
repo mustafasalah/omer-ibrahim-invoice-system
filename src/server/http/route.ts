@@ -1,6 +1,7 @@
 import "server-only";
 
 import { NextResponse } from "next/server";
+import { deleteSessionCookie } from "@/server/auth/cookies";
 import { getLogger } from "@/server/logging/logger";
 import { toApiError } from "./errors";
 import { getRequestId } from "./request-id";
@@ -19,7 +20,7 @@ export function withApiHandler(handler: ApiHandler): (request: Request) => Promi
     try {
       return withRequestId(await handler({ request, requestId }), requestId);
     } catch (error) {
-      const { body, status } = toApiError(error, requestId);
+      const { body, status, headers } = toApiError(error, requestId);
       try {
         getLogger().error(
           {
@@ -34,7 +35,11 @@ export function withApiHandler(handler: ApiHandler): (request: Request) => Promi
       } catch {
         // Logging must never replace the stable, redacted API error response.
       }
-      return withRequestId(NextResponse.json(body, { status }), requestId);
+      const response = NextResponse.json(body, { status, headers });
+      if (status === 401) {
+        deleteSessionCookie(response, request);
+      }
+      return withRequestId(response, requestId);
     }
   };
 }

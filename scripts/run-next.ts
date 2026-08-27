@@ -13,6 +13,7 @@ const nextCli = path.resolve("node_modules", "next", "dist", "bin", "next");
 const childEnvironment: NodeJS.ProcessEnv = {
   ...process.env,
   NEXT_TELEMETRY_DISABLED: "1",
+  SESSION_SECRET: config.sessionSecret,
 };
 
 for (const agentVariable of [
