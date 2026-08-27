@@ -1,0 +1,28 @@
+# Dependencies and generated framework output
+node_modules/
+.next/
+out/
+coverage/
+next-env.d.ts
+*.tsbuildinfo
+
+# Local runtime and test artifacts
+data/
+.npm-cache/
+.tools/
+playwright-report/
+test-results/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Local configuration and logs
+.env*
+!.env.example
+*.log
+
+# Editor and operating-system artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
