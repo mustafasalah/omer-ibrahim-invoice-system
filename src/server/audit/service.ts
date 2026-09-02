@@ -10,6 +10,8 @@ export type AuditEvent = {
   actorDisplayName: string | null;
   entityType: string | null;
   entityId: string | null;
+  invoiceId?: string | null;
+  invoiceNumber?: string | null;
   summary: string;
   changes?: Record<string, unknown>;
   createdAt: string;
@@ -24,8 +26,8 @@ export function appendAuditEvent(connection: DatabaseConnection, event: AuditEve
       eventType: event.eventType,
       actorUserId: event.actorUserId,
       actorDisplayName: event.actorDisplayName,
-      invoiceId: null,
-      invoiceNumber: null,
+      invoiceId: event.invoiceId ?? null,
+      invoiceNumber: event.invoiceNumber ?? null,
       entityType: event.entityType,
       entityId: event.entityId,
       summary: event.summary,

@@ -117,11 +117,20 @@ export function validationError(fieldErrors?: Record<string, string>): AppError 
   });
 }
 
-export function conflictError(): AppError {
+export function conflictError(fieldErrors?: Record<string, string>): AppError {
   return new AppError({
     code: apiErrorCodes.CONFLICT,
     message: getMessages().errors.conflict,
     status: 409,
+    fieldErrors,
+  });
+}
+
+export function notFoundError(): AppError {
+  return new AppError({
+    code: apiErrorCodes.NOT_FOUND,
+    message: getMessages().errors.notFound,
+    status: 404,
   });
 }
 

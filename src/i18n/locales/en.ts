@@ -124,6 +124,8 @@ export const enMessages = {
   audit: {
     adminBootstrapped: "Created the first system administrator",
     settingsUpdated: "Updated basic settings",
+    invoiceCreated: "Created an invoice draft",
+    invoiceDraftUpdated: "Updated an invoice draft",
   },
   errors: {
     internal: "The request could not be completed.",

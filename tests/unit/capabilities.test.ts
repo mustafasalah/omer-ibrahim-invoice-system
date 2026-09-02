@@ -5,6 +5,8 @@ describe("role capability mapping", () => {
   it("grants shared invoice capabilities to both roles", () => {
     expect(roleHasCapability("ADMIN", "invoice.create")).toBe(true);
     expect(roleHasCapability("EMPLOYEE", "invoice.create")).toBe(true);
+    expect(roleHasCapability("ADMIN", "invoice.edit_draft")).toBe(true);
+    expect(roleHasCapability("EMPLOYEE", "invoice.edit_draft")).toBe(true);
     expect(getCapabilitiesForRole("EMPLOYEE")).toContain("dashboard.read");
   });
 

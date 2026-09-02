@@ -122,6 +122,8 @@ export const arMessages = {
   audit: {
     adminBootstrapped: "إنشاء المدير الأول للنظام",
     settingsUpdated: "تحديث الإعدادات الأساسية",
+    invoiceCreated: "إنشاء مسودة فاتورة",
+    invoiceDraftUpdated: "تحديث مسودة فاتورة",
   },
   errors: {
     internal: "تعذر إكمال الطلب.",
