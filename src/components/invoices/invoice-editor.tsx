@@ -11,6 +11,7 @@ import {
   createEditorState,
   draftToPlainText,
   duplicateEditorItem,
+  editorDraftFingerprint,
   editorItemHasData,
   emptyEditorItem,
   moveEditorItem,
@@ -69,14 +70,13 @@ export function InvoiceEditor({
   const router = useRouter();
   const firstState = useMemo(() => initialState(defaults, initialInvoice), [defaults, initialInvoice]);
   const [invoice, setInvoice] = useState(firstState);
-  const [baseline, setBaseline] = useState(() => JSON.stringify(firstState));
+  const [baseline, setBaseline] = useState(() => editorDraftFingerprint(firstState));
   const [status, setStatus] = useState<EditorStatus>("ready");
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [statusMessage, setStatusMessage] = useState("");
   const [warnings, setWarnings] = useState<string[]>([]);
   const [copyFallback, setCopyFallback] = useState("");
-  const [pendingEditUrl, setPendingEditUrl] = useState("");
-  const dirty = JSON.stringify(invoice) !== baseline;
+  const dirty = editorDraftFingerprint(invoice) !== baseline;
   const preview = useMemo(() => calculateEditorPreview(invoice.items, invoice.currency), [invoice.items, invoice.currency]);
   const displayedPreview = invoice.serverPreview ?? preview;
 
@@ -142,11 +142,13 @@ export function InvoiceEditor({
       }
       const next = stateFromInvoice(saved);
       setInvoice(next);
-      setBaseline(JSON.stringify(next));
+      setBaseline(editorDraftFingerprint(next));
       setWarnings((body.warnings ?? []).filter((warning) => warning.code === "FUTURE_INVOICE_DATE").map(() => messages.futureDateWarning));
       setStatus("saved");
       setStatusMessage(messages.saved.replace("{number}", saved.invoiceNumber));
-      if (isCreate) setPendingEditUrl(`/invoices/${encodeURIComponent(saved.id)}/edit?saved=1`);
+      if (isCreate) {
+        window.setTimeout(() => router.replace(`/invoices/${encodeURIComponent(saved.id)}/edit?saved=1`), 0);
+      }
     } catch {
       setStatus("unavailable");
       setStatusMessage(messages.unavailable);
@@ -160,12 +162,6 @@ export function InvoiceEditor({
     window.addEventListener("beforeunload", beforeUnload);
     return () => window.removeEventListener("beforeunload", beforeUnload);
   }, [dirty, messages.leaveWarning]);
-
-  useEffect(() => {
-    if (pendingEditUrl && !dirty) {
-      router.replace(pendingEditUrl);
-    }
-  }, [dirty, pendingEditUrl, router]);
 
   useEffect(() => {
     const shortcut = (event: globalThis.KeyboardEvent) => {
@@ -235,7 +231,7 @@ export function InvoiceEditor({
       const latest = response.ok ? parseInvoiceResponse(body.invoice) : null;
       if (!latest || latest.invoiceStatus !== "DRAFT" || latest.isArchived) { setStatus("malformed"); return; }
       const next = stateFromInvoice(latest);
-      setInvoice(next); setBaseline(JSON.stringify(next)); setFieldErrors({}); setStatus("ready"); setCopyFallback("");
+      setInvoice(next); setBaseline(editorDraftFingerprint(next)); setFieldErrors({}); setStatus("ready"); setCopyFallback("");
     } catch { setStatus("unavailable"); setStatusMessage(messages.unavailable); }
   }
   async function copyInput() {

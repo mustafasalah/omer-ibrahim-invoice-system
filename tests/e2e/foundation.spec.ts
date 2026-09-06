@@ -92,7 +92,7 @@ test("setup → login → settings → create and edit draft → logout", async 
   await expect(page.getByLabel("اسم المستفيد")).toHaveValue("مستشفى الأمل");
   await quantities.first().fill("2.5");
   await page.getByRole("button", { name: "حفظ كمسودة" }).click();
-  await expect(page.getByRole("status").first()).toContainText("تم حفظ المسودة");
+  await expect(page.locator(".invoice-notice--success")).toContainText("حُفظت المسودة");
   const secondSavedResponse = await page.request.get(`/api/invoices/${invoiceId}`);
   const secondSaved = await secondSavedResponse.json() as { invoice: { invoiceNumber: string; rowVersion: number; totals: { grandTotalMinor: string } } };
   expect(secondSaved.invoice).toMatchObject({ invoiceNumber, rowVersion: firstSaved.invoice.rowVersion + 1, totals: { grandTotalMinor: "20000" } });

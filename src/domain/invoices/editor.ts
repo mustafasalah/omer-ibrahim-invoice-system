@@ -180,6 +180,10 @@ export function draftToPlainText(state: InvoiceEditorState): string {
   ].join("\n");
 }
 
+export function editorDraftFingerprint(state: InvoiceEditorState): string {
+  return JSON.stringify(toDraftInput(state));
+}
+
 export function parseInvoiceResponse(value: unknown): InvoiceDraftDto | null {
   const parsed = invoiceDtoSchema.safeParse(value);
   return parsed.success ? parsed.data : null;

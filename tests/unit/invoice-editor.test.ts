@@ -4,6 +4,7 @@ import {
   createEditorState,
   draftToPlainText,
   duplicateEditorItem,
+  editorDraftFingerprint,
   editorItemHasData,
   emptyEditorItem,
   moveEditorItem,
@@ -73,5 +74,17 @@ describe("invoice draft editor state", () => {
     const input = toDraftInput(state);
     expect(input.notes).toHaveLength(2_001);
     expect(input.paymentTerms).toHaveLength(2_001);
+  });
+
+  it("tracks only editable draft input and clears dirty state after a saved baseline", () => {
+    const state = createEditorState(defaults, "first");
+    const baseline = editorDraftFingerprint(state);
+    state.serverPreview = { subtotalMinor: "0", grandTotalMinor: "0", lineTotals: {} };
+    state.rowVersion = 2;
+    expect(editorDraftFingerprint(state)).toBe(baseline);
+    state.notes = "تغيير";
+    expect(editorDraftFingerprint(state)).not.toBe(baseline);
+    const savedBaseline = editorDraftFingerprint(state);
+    expect(editorDraftFingerprint(state)).toBe(savedBaseline);
   });
 });
