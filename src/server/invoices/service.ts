@@ -6,7 +6,7 @@ import { InvoiceCalculationError, type CalculatedInvoice } from "@/domain/invoic
 import {
   dateInTimezone, DraftValidationError, isValidIsoDate, normalizeSuggestionName,
   parseCreateDraft, parseUpdateDraft, type DraftActor, type DraftBeneficiaryInput,
-  type DraftInvoiceInput, type DraftItemInput,
+  type DraftInvoiceInput, type DraftItemInput, type DraftResult, type InvoiceDraftDto,
 } from "@/domain/invoices/draft";
 import { SETTINGS_ID } from "@/domain/settings/contracts";
 import { getMessages } from "@/i18n";
@@ -60,26 +60,6 @@ type PreparedItem = DraftItemInput & { row: ProductRow | null; productId: string
 export type InvoiceFaultPoint = "afterSequence" | "afterSuggestions" | "afterInvoice" | "afterItems" | "afterAudit";
 type FaultInjector = (point: InvoiceFaultPoint) => void;
 type AuditAppender = (connection: DatabaseConnection, event: AuditEvent) => void;
-
-export type InvoiceDraftDto = {
-  id: string; invoiceNumber: string; invoiceStatus: string; paymentStatus: string; isArchived: boolean;
-  invoiceDate: string; dueDate: string | null;
-  beneficiary: { suggestionId: string | null; name: string | null; phone: string | null;
-    address: string | null; registrationNumber: string | null };
-  currency: { code: string; symbol: string; decimals: number };
-  items: Array<{ id: string; productSuggestionId: string | null; sortOrder: number; productName: string | null;
-    description: string | null; unit: string | null; quantity: string | null; unitPrice: string | null;
-    baseMinor: string; discountMinor: string; allocatedInvoiceDiscountMinor: string;
-    taxableMinor: string; taxMinor: string; lineTotalMinor: string }>;
-  totals: { subtotalMinor: string; lineDiscountsMinor: string; invoiceDiscountMinor: string;
-    discountTotalMinor: string; taxableTotalMinor: string; taxTotalMinor: string; grandTotalMinor: string;
-    grossPaidMinor: string; refundedTotalMinor: string; netCollectedMinor: string; remainingMinor: string };
-  notes: string | null; paymentTerms: string | null;
-  createdAt: string; createdBy: { id: string; displayName: string };
-  updatedAt: string; updatedBy: { id: string; displayName: string }; rowVersion: number;
-};
-
-export type DraftResult = { invoice: InvoiceDraftDto; warnings: Array<{ code: "FUTURE_INVOICE_DATE" }> };
 
 function settingsRow(connection: DatabaseConnection, now: string): SettingsRow {
   let row = connection.client.prepare(`select currency_code as currencyCode, currency_symbol_ar as currencySymbol,

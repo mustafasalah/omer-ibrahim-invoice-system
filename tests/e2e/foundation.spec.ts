@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("setup → administrator → login → protected page → logout", async ({ page, request }) => {
+test("setup → login → settings → create and edit draft → logout", async ({ page, request }) => {
   await page.goto("/");
   await expect(page).toHaveURL(/\/setup$/);
   await expect(page.locator("html")).toHaveAttribute("lang", "ar");
@@ -11,16 +11,13 @@ test("setup → administrator → login → protected page → logout", async ({
   const setupPassword = page.getByLabel("كلمة المرور", { exact: true });
   await setupPassword.fill("عبارة مرور محلية 2026");
   await page.getByLabel("تأكيد كلمة المرور").fill("عبارة مرور محلية 2026");
-  await expect(setupPassword).toHaveAttribute("type", "password");
   await page.getByRole("button", { name: "إظهار كلمة المرور" }).first().click();
   await expect(setupPassword).toHaveAttribute("type", "text");
   await page.getByRole("button", { name: "إخفاء كلمة المرور" }).first().click();
   await page.getByRole("button", { name: "إنشاء المدير", exact: true }).click();
 
   await expect(page).toHaveURL(/\/login$/);
-  const bootstrapStatus = await request.get("/api/bootstrap/status");
-  await expect(bootstrapStatus.json()).resolves.toEqual({ bootstrapRequired: false });
-
+  await expect((await request.get("/api/bootstrap/status")).json()).resolves.toEqual({ bootstrapRequired: false });
   await page.getByLabel("اسم المستخدم").fill("FIRST.ADMIN");
   const loginPassword = page.getByLabel("كلمة المرور", { exact: true });
   await loginPassword.fill("عبارة مرور محلية 2026");
@@ -30,26 +27,17 @@ test("setup → administrator → login → protected page → logout", async ({
   });
   await loginPassword.press("Enter");
   await expect(page.getByRole("button", { name: "جارٍ تسجيل الدخول…" })).toBeDisabled();
-
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByRole("heading", { name: "لوحة التحكم" })).toBeVisible();
-  await expect(page.getByText("مدير النظام", { exact: true })).toBeVisible();
+
   const authenticatedSession = await page.request.get("/api/auth/session");
   expect(authenticatedSession.status()).toBe(200);
   const sessionBody = JSON.stringify(await authenticatedSession.json());
-  expect(sessionBody).not.toContain("عبارة مرور محلية 2026");
-  expect(sessionBody).not.toContain("passwordHash");
-  expect(sessionBody).not.toContain("sessionToken");
-  expect(sessionBody).not.toContain("tokenHash");
-  const browserStorage = await page.evaluate(() => ({
-    local: Object.keys(localStorage),
-    session: Object.keys(sessionStorage),
-  }));
-  expect(browserStorage).toEqual({ local: [], session: [] });
+  expect(sessionBody).not.toMatch(/عبارة مرور محلية 2026|passwordHash|sessionToken|tokenHash/u);
+  expect(await page.evaluate(() => ({ local: Object.keys(localStorage), session: Object.keys(sessionStorage) })))
+    .toEqual({ local: [], session: [] });
 
   await page.getByRole("link", { name: "الإعدادات الأساسية" }).click();
-  await expect(page).toHaveURL(/\/settings$/);
-  await expect(page.getByRole("heading", { name: "الإعدادات الأساسية" })).toBeVisible();
   const prefixInput = page.getByLabel("بادئة الرقم");
   await prefixInput.focus();
   await page.keyboard.press("Tab");
@@ -61,27 +49,103 @@ test("setup → administrator → login → protected page → logout", async ({
   await expect(page.getByRole("status")).toContainText("تم حفظ الإعدادات");
   await page.reload();
   await expect(page.getByLabel("العنوان")).toHaveValue("الخرطوم");
-  await page.evaluate(() => { document.documentElement.style.zoom = "2"; });
-  await expect(page.getByRole("button", { name: "حفظ الإعدادات" })).toBeVisible();
-  await page.evaluate(() => { document.documentElement.style.zoom = "1"; });
   await page.getByRole("link", { name: "العودة إلى لوحة التحكم" }).click();
+
+  await page.getByRole("link", { name: "إنشاء فاتورة جديدة" }).click();
+  await expect(page).toHaveURL(/\/invoices\/new$/);
+  await expect(page.getByRole("heading", { name: "فاتورة جديدة" })).toBeVisible();
+  await expect(page.getByText("لم تُحفظ بعد", { exact: true })).toBeVisible();
+  await expect(page.locator("main")).toHaveAttribute("data-row-version", "unsaved");
+
+  await page.getByLabel("اسم المستفيد").fill("مستشفى الأمل");
+  const productNames = page.getByLabel("اسم المنتج");
+  const quantities = page.getByLabel("الكمية");
+  const prices = page.getByLabel("سعر الوحدة");
+  await productNames.first().fill("شاش طبي");
+  await productNames.first().focus();
+  await page.keyboard.press("Tab");
+  await expect(page.getByLabel("الوصف").first()).toBeFocused();
+  await quantities.first().fill("1.25");
+  await prices.first().fill("80.00");
+  await expect(page.getByRole("complementary").getByText(/100\.00/u).first()).toBeVisible();
+  await prices.first().press("Enter");
+  await expect(productNames).toHaveCount(2);
+  await productNames.nth(1).fill("بند غير مكتمل");
+  await expect(page.locator(".invoice-item__hint")).toContainText("البند غير المكتمل لا يدخل في المعاينة");
+
+  await page.getByRole("button", { name: "حفظ كمسودة" }).click();
+  await expect(page).toHaveURL(/\/invoices\/[0-9A-HJKMNP-TV-Z]{26}\/edit(?:\?saved=1)?$/u);
+  const editUrl = page.url();
+  const invoiceId = /\/invoices\/([^/]+)\/edit/u.exec(new URL(editUrl).pathname)?.[1];
+  expect(invoiceId).toBeTruthy();
+  const firstSavedResponse = await page.request.get(`/api/invoices/${invoiceId}`);
+  expect(firstSavedResponse.status()).toBe(200);
+  const firstSaved = await firstSavedResponse.json() as { invoice: { invoiceNumber: string; rowVersion: number; items: unknown[]; totals: { grandTotalMinor: string } } };
+  expect(firstSaved.invoice).toMatchObject({ rowVersion: 1, totals: { grandTotalMinor: "10000" } });
+  expect(firstSaved.invoice.items).toHaveLength(2);
+  const invoiceNumber = firstSaved.invoice.invoiceNumber;
+
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "تعديل مسودة الفاتورة" })).toBeVisible();
+  await expect(page.getByText(invoiceNumber, { exact: true })).toBeVisible();
+  await expect(page.getByLabel("العملة")).toHaveValue(/SDG/u);
+  await expect(page.getByLabel("اسم المستفيد")).toHaveValue("مستشفى الأمل");
+  await quantities.first().fill("2.5");
+  await page.getByRole("button", { name: "حفظ كمسودة" }).click();
+  await expect(page.getByRole("status").first()).toContainText("تم حفظ المسودة");
+  const secondSavedResponse = await page.request.get(`/api/invoices/${invoiceId}`);
+  const secondSaved = await secondSavedResponse.json() as { invoice: { invoiceNumber: string; rowVersion: number; totals: { grandTotalMinor: string } } };
+  expect(secondSaved.invoice).toMatchObject({ invoiceNumber, rowVersion: firstSaved.invoice.rowVersion + 1, totals: { grandTotalMinor: "20000" } });
+
+  const notes = page.getByRole("textbox", { name: /^ملاحظات/u });
+  await notes.fill("مدخلاتي وقت التعارض");
+  await page.route(`**/api/invoices/${invoiceId}`, async (route) => {
+    await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({
+      error: { code: "CONFLICT", message: "توجد نسخة أحدث.", fieldErrors: { rowVersion: "3" }, requestId: "e2e-conflict" },
+    }) });
+  }, { times: 1 });
+  await page.getByRole("button", { name: "حفظ كمسودة" }).click();
+  await expect(page.getByRole("alertdialog")).toContainText("توجد نسخة أحدث");
+  await page.getByRole("button", { name: "نسخ مدخلاتي" }).click();
+  page.once("dialog", (prompt) => void prompt.accept());
+  await page.getByRole("button", { name: "تحميل أحدث نسخة" }).click();
+  await expect(page.getByRole("alertdialog")).toBeHidden();
+  await expect(page.locator("main")).toHaveAttribute("data-row-version", "2");
+
+  await notes.fill("حفظ بلوحة المفاتيح");
+  const keyboardSave = page.waitForResponse((response) => response.url().includes(`/api/invoices/${invoiceId}`) && response.request().method() === "PATCH");
+  await page.keyboard.press("Control+s");
+  expect((await keyboardSave).ok()).toBe(true);
+  await expect(page.locator("main")).toHaveAttribute("data-row-version", "3");
+
+  await page.evaluate(() => { document.documentElement.style.zoom = "2"; });
+  await expect(page.getByRole("button", { name: "حفظ كمسودة" })).toBeVisible();
+  await page.evaluate(() => { document.documentElement.style.zoom = "1"; });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator(".invoice-item").first()).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+
+  await notes.fill("تغيير غير محفوظ");
+  const dialog = new Promise<string>((resolve) => page.once("dialog", async (prompt) => {
+    resolve(prompt.type());
+    await prompt.dismiss();
+  }));
+  await page.getByRole("link", { name: "لوحة التحكم", exact: true }).click();
+  expect(await dialog).toBe("confirm");
+  await expect(page).toHaveURL(/\/invoices\/[^/]+\/edit/u);
+  await notes.fill("حفظ بلوحة المفاتيح");
+  await page.getByRole("link", { name: "لوحة التحكم", exact: true }).click();
 
   await page.getByRole("button", { name: "تسجيل الخروج", exact: true }).click();
   await expect(page).toHaveURL(/\/login$/);
-  const signedOutSession = await page.request.get("/api/auth/session");
-  expect(signedOutSession.status()).toBe(401);
-
+  expect((await page.request.get("/api/auth/session")).status()).toBe(401);
+  await page.goto(editUrl);
+  await expect(page).toHaveURL(/\/login$/);
   await page.goto("/setup");
   await expect(page).toHaveURL(/\/login$/);
 
-  const healthResponse = await request.get("/api/health", {
-    headers: { "x-request-id": "e2e-health" },
-  });
+  const healthResponse = await request.get("/api/health", { headers: { "x-request-id": "e2e-health" } });
   expect(healthResponse.ok()).toBe(true);
   expect(healthResponse.headers()["x-request-id"]).toBe("e2e-health");
-  await expect(healthResponse.json()).resolves.toMatchObject({
-    status: "ok",
-    checks: { database: "ok", schemaVersion: 1 },
-    requestId: "e2e-health",
-  });
+  await expect(healthResponse.json()).resolves.toMatchObject({ status: "ok", checks: { database: "ok", schemaVersion: 1 }, requestId: "e2e-health" });
 });

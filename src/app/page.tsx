@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import Link from "next/link";
 import { LogoutButton } from "@/components/auth/logout-button";
 import { getMessages } from "@/i18n";
 import { getBootstrapStatus } from "@/server/auth/bootstrap";
@@ -43,8 +44,11 @@ export default async function HomePage() {
           </div>
         </dl>
       </section>
+      {session.user.capabilities.includes("invoice.create") && (
+        <Link className="dashboard__create-link" href="/invoices/new">{messages.dashboard.createInvoice}</Link>
+      )}
       {session.user.capabilities.includes("settings.manage") && (
-        <a className="dashboard__settings-link" href="/settings">{messages.settings.title}</a>
+        <Link className="dashboard__settings-link" href="/settings">{messages.settings.title}</Link>
       )}
     </main>
   );

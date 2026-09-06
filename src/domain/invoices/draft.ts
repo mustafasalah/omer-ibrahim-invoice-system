@@ -44,6 +44,36 @@ export type DraftInvoiceInput = {
 export type CreateDraftRequest = { intent: "SAVE_DRAFT"; invoice: DraftInvoiceInput };
 export type UpdateDraftRequest = { rowVersion: number; invoice: DraftInvoiceInput };
 
+export type InvoiceEditorDefaults = {
+  invoiceDate: string;
+  currency: { code: string; symbol: string; decimals: number };
+  taxEnabled: false;
+  paymentTerms: string | null;
+};
+
+export type InvoiceDraftDto = {
+  id: string; invoiceNumber: string; invoiceStatus: string; paymentStatus: string; isArchived: boolean;
+  invoiceDate: string; dueDate: string | null;
+  beneficiary: { suggestionId: string | null; name: string | null; phone: string | null;
+    address: string | null; registrationNumber: string | null };
+  currency: { code: string; symbol: string; decimals: number };
+  items: Array<{ id: string; productSuggestionId: string | null; sortOrder: number; productName: string | null;
+    description: string | null; unit: string | null; quantity: string | null; unitPrice: string | null;
+    baseMinor: string; discountMinor: string; allocatedInvoiceDiscountMinor: string;
+    taxableMinor: string; taxMinor: string; lineTotalMinor: string }>;
+  totals: { subtotalMinor: string; lineDiscountsMinor: string; invoiceDiscountMinor: string;
+    discountTotalMinor: string; taxableTotalMinor: string; taxTotalMinor: string; grandTotalMinor: string;
+    grossPaidMinor: string; refundedTotalMinor: string; netCollectedMinor: string; remainingMinor: string };
+  notes: string | null; paymentTerms: string | null;
+  createdAt: string; createdBy: { id: string; displayName: string };
+  updatedAt: string; updatedBy: { id: string; displayName: string }; rowVersion: number;
+};
+
+export type DraftResult = {
+  invoice: InvoiceDraftDto;
+  warnings: Array<{ code: "FUTURE_INVOICE_DATE" }>;
+};
+
 export class DraftValidationError extends Error {
   constructor(readonly fieldErrors: Record<string, string>) {
     super("Invalid invoice draft.");
