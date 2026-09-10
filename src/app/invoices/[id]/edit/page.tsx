@@ -9,8 +9,13 @@ import { getInvoiceDraft } from "@/server/invoices/service";
 
 export const dynamic = "force-dynamic";
 
-function StatePage({ message, back }: { message: string; back: string }) {
-  return <main className="invoice-state-page" id="main-content"><div role="alert">{message}</div><Link href="/">{back}</Link></main>;
+function StatePage({ message, back, invoiceNumber, status }: {
+  message: string; back: string; invoiceNumber?: string; status?: string;
+}) {
+  return <main className="invoice-state-page" id="main-content">
+    {invoiceNumber && <header><span className="status-badge">{status}</span><h1><bdi>{invoiceNumber}</bdi></h1></header>}
+    <div role="alert">{message}</div><Link href="/">{back}</Link>
+  </main>;
 }
 
 export default async function EditInvoicePage({ params }: { params: Promise<{ id: string }> }) {
@@ -34,7 +39,8 @@ export default async function EditInvoicePage({ params }: { params: Promise<{ id
     return <StatePage message={messages.invoiceEditor.unavailable} back={messages.invoiceEditor.backDashboard} />;
   }
   if (invoice.isArchived) return <StatePage message={messages.invoiceEditor.blockedArchived} back={messages.invoiceEditor.backDashboard} />;
-  if (invoice.invoiceStatus === "ISSUED") return <StatePage message={messages.invoiceEditor.blockedIssued} back={messages.invoiceEditor.backDashboard} />;
+  if (invoice.invoiceStatus === "ISSUED") return <StatePage message={messages.invoiceEditor.blockedIssued}
+    back={messages.invoiceEditor.backDashboard} invoiceNumber={invoice.invoiceNumber} status={messages.invoiceEditor.issuedStatus} />;
   if (invoice.invoiceStatus === "CANCELLED") return <StatePage message={messages.invoiceEditor.blockedCancelled} back={messages.invoiceEditor.backDashboard} />;
   if (invoice.invoiceStatus !== "DRAFT") return <StatePage message={messages.invoiceEditor.malformed} back={messages.invoiceEditor.backDashboard} />;
 

@@ -5,7 +5,7 @@ import { calculateInvoice } from "@/domain/invoices/calculator";
 import { InvoiceCalculationError, type CalculatedInvoice } from "@/domain/invoices/contracts";
 import {
   dateInTimezone, DraftValidationError, isValidIsoDate, normalizeSuggestionName,
-  parseCreateDraft, parseUpdateDraft, type DraftActor, type DraftBeneficiaryInput,
+  parseCreateDraft, parseCreateIssue, parseUpdateDraft, parseUpdateIssue, type DraftActor, type DraftBeneficiaryInput,
   type DraftInvoiceInput, type DraftItemInput, type DraftResult, type InvoiceDraftDto,
 } from "@/domain/invoices/draft";
 import { SETTINGS_ID } from "@/domain/settings/contracts";
@@ -13,9 +13,10 @@ import { getMessages } from "@/i18n";
 import { appendAuditEvent, type AuditEvent } from "@/server/audit/service";
 import { getDatabase, type DatabaseConnection } from "@/server/db/connection";
 import { withImmediateTransaction } from "@/server/db/transaction";
-import { conflictError, notFoundError, validationError } from "@/server/http/errors";
+import { conflictError, forbiddenError, notFoundError, validationError } from "@/server/http/errors";
 import { insertDefaultSettings } from "@/server/settings/defaults";
 import { reserveInvoiceNumber } from "./numbering";
+import { capturePrintSnapshot, readPrintSnapshot } from "./print-snapshot";
 
 type SettingsRow = {
   currencyCode: string; currencySymbol: string; currencyDecimals: bigint;
@@ -44,7 +45,8 @@ type InvoiceRow = {
   grandTotalMinor: bigint; grossPaidMinor: bigint; refundedTotalMinor: bigint;
   netCollectedMinor: bigint; remainingMinor: bigint; notes: string | null; paymentTerms: string | null;
   createdAt: string; createdBy: string; createdByName: string; updatedAt: string;
-  updatedBy: string; updatedByName: string; rowVersion: bigint;
+  updatedBy: string; updatedByName: string; issuedAt: string | null;
+  issuedBy: string | null; issuedByName: string | null; rowVersion: bigint;
 };
 
 type ItemRow = {
@@ -57,9 +59,24 @@ type ItemRow = {
 type PreparedBeneficiary = DraftBeneficiaryInput & { row: BeneficiaryRow | null };
 type PreparedItem = DraftItemInput & { row: ProductRow | null; productId: string | null };
 
-export type InvoiceFaultPoint = "afterSequence" | "afterSuggestions" | "afterInvoice" | "afterItems" | "afterAudit";
+export type InvoiceFaultPoint = "afterSequence" | "afterSuggestions" | "afterInvoice" | "afterItems" |
+  "afterSnapshot" | "afterStatus" | "afterAudit";
 type FaultInjector = (point: InvoiceFaultPoint) => void;
 type AuditAppender = (connection: DatabaseConnection, event: AuditEvent) => void;
+type SnapshotCapturer = typeof capturePrintSnapshot;
+
+function issuePath(path: string): string {
+  if (path.startsWith("invoice.itemsByClientKey.")) return path.slice("invoice.".length);
+  if (path.startsWith("invoice.items.")) return path.slice("invoice.".length);
+  if (path === "invoice.invoiceDate") return "invoiceDate";
+  if (path === "invoice.dueDate") return "dueDate";
+  if (path === "invoice.beneficiary.name") return "beneficiary.name";
+  return path;
+}
+
+function toIssueFieldErrors(fields: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(fields).map(([path, value]) => [issuePath(path), value]));
+}
 
 function settingsRow(connection: DatabaseConnection, now: string): SettingsRow {
   let row = connection.client.prepare(`select currency_code as currencyCode, currency_symbol_ar as currencySymbol,
@@ -74,7 +91,8 @@ function settingsRow(connection: DatabaseConnection, now: string): SettingsRow {
   return row;
 }
 
-function validateDates(input: DraftInvoiceInput, fallbackDate: string, timezone: string, at: Date, role: DraftActor["role"]): {
+function validateDates(input: DraftInvoiceInput, fallbackDate: string, timezone: string, at: Date,
+  role: DraftActor["role"], paths: "draft" | "issue" = "draft"): {
   invoiceDate: string; dueDate: string | null; warnings: DraftResult["warnings"];
 } {
   const invoiceDate = input.invoiceDate ?? fallbackDate;
@@ -88,7 +106,7 @@ function validateDates(input: DraftInvoiceInput, fallbackDate: string, timezone:
   if (role === "EMPLOYEE" && isValidIsoDate(invoiceDate) && invoiceDate > companyToday) {
     fields["invoice.invoiceDate"] = "FUTURE_DATE_FORBIDDEN";
   }
-  if (Object.keys(fields).length > 0) throw validationError(fields);
+  if (Object.keys(fields).length > 0) throw validationError(paths === "issue" ? toIssueFieldErrors(fields) : fields);
   return { invoiceDate, dueDate: input.dueDate, warnings: invoiceDate > companyToday ? [{ code: "FUTURE_INVOICE_DATE" }] : [] };
 }
 
@@ -103,13 +121,19 @@ function beneficiaryByName(connection: DatabaseConnection, normalized: string): 
     where normalized_name=? order by is_active desc,last_used_at desc,id limit 1`).get(normalized) as BeneficiaryRow | undefined;
 }
 
-function prepareBeneficiary(connection: DatabaseConnection, input: DraftBeneficiaryInput | null): PreparedBeneficiary | null {
+function prepareBeneficiary(connection: DatabaseConnection, input: DraftBeneficiaryInput | null,
+  paths: "draft" | "issue" = "draft"): PreparedBeneficiary | null {
   if (!input) return null;
   const row = input.suggestionId ? beneficiaryById(connection, input.suggestionId)
     : input.name ? beneficiaryByName(connection, normalizeSuggestionName(input.name)) : undefined;
-  if (input.suggestionId && !row) throw validationError({ "invoice.beneficiary.suggestionId": "SUGGESTION_NOT_FOUND" });
+  if (input.suggestionId && !row) throw validationError({
+    [paths === "issue" ? "beneficiary.suggestionId" : "invoice.beneficiary.suggestionId"]: "SUGGESTION_NOT_FOUND",
+  });
   if (row?.isActive === 0n && !input.reactivateSuggestion) {
-    throw validationError({ "invoice.beneficiary.reactivateSuggestion": "EXPLICIT_REACTIVATION_REQUIRED" });
+    throw validationError({
+      [paths === "issue" ? "beneficiary.reactivateSuggestion" : "invoice.beneficiary.reactivateSuggestion"]:
+        "EXPLICIT_REACTIVATION_REQUIRED",
+    });
   }
   return {
     ...input, row: row ?? null,
@@ -131,15 +155,16 @@ function productByName(connection: DatabaseConnection, normalized: string): Prod
     from products where normalized_name=? order by is_active desc,last_used_at desc,id limit 1`).get(normalized) as ProductRow | undefined;
 }
 
-function prepareItems(connection: DatabaseConnection, items: DraftItemInput[], currencyCode: string): PreparedItem[] {
+function prepareItems(connection: DatabaseConnection, items: DraftItemInput[], currencyCode: string,
+  paths: "draft" | "issue" = "draft"): PreparedItem[] {
   return items.map((input, index) => {
     const row = input.productSuggestionId ? productById(connection, input.productSuggestionId)
       : input.productName ? productByName(connection, normalizeSuggestionName(input.productName)) : undefined;
     if (input.productSuggestionId && !row) {
-      throw validationError({ [`invoice.items.${index}.productSuggestionId`]: "SUGGESTION_NOT_FOUND" });
+      throw validationError({ [`${paths === "issue" ? "" : "invoice."}items.${index}.productSuggestionId`]: "SUGGESTION_NOT_FOUND" });
     }
     if (row?.isActive === 0n && !input.reactivateSuggestion) {
-      throw validationError({ [`invoice.items.${index}.reactivateSuggestion`]: "EXPLICIT_REACTIVATION_REQUIRED" });
+      throw validationError({ [`${paths === "issue" ? "" : "invoice."}items.${index}.reactivateSuggestion`]: "EXPLICIT_REACTIVATION_REQUIRED" });
     }
     const selectedPrice = input.productSuggestionId && row?.lastCurrencyCode === currencyCode ? row.lastUnitPrice : null;
     return { ...input, row: row ?? null, productId: row?.id ?? null,
@@ -149,7 +174,8 @@ function prepareItems(connection: DatabaseConnection, items: DraftItemInput[], c
   });
 }
 
-function calculate(items: PreparedItem[], currency: { code: string; symbol: string; decimals: number }): {
+function calculate(items: PreparedItem[], currency: { code: string; symbol: string; decimals: number },
+  paths: "draft" | "issue" = "draft"): {
   calculated: CalculatedInvoice; lineCalculations: Array<CalculatedInvoice["lines"][number] | null>;
 } {
   const completeIndexes: number[] = [];
@@ -172,13 +198,14 @@ function calculate(items: PreparedItem[], currency: { code: string; symbol: stri
         const itemIndex = completeIndexes[completeIndex];
         if (itemIndex !== undefined) {
           const suffix = match[2] ?? "";
-          const fields: Record<string, string> = { [`invoice.items.${itemIndex}${suffix}`]: error.code };
+          const prefix = paths === "issue" ? "" : "invoice.";
+          const fields: Record<string, string> = { [`${prefix}items.${itemIndex}${suffix}`]: error.code };
           const clientKey = items[itemIndex]?.clientKey;
-          if (clientKey) fields[`invoice.itemsByClientKey.${clientKey}${suffix}`] = error.code;
+          if (clientKey) fields[`${prefix}itemsByClientKey.${clientKey}${suffix}`] = error.code;
           throw validationError(fields);
         }
       }
-      throw validationError({ [error.path ?? "invoice"]: error.code });
+      throw validationError({ [paths === "issue" ? issuePath(error.path ?? "invoice") : (error.path ?? "invoice")]: error.code });
     }
     throw error;
   }
@@ -262,8 +289,10 @@ function readInvoiceRow(connection: DatabaseConnection, id: string): InvoiceRow 
     i.gross_paid_minor as grossPaidMinor,i.refunded_total_minor as refundedTotalMinor,
     i.net_collected_minor as netCollectedMinor,i.remaining_minor as remainingMinor,i.notes,i.payment_terms as paymentTerms,
     i.created_at as createdAt,i.created_by as createdBy,cu.display_name as createdByName,
-    i.updated_at as updatedAt,i.updated_by as updatedBy,uu.display_name as updatedByName,i.row_version as rowVersion
-    from invoices i join users cu on cu.id=i.created_by join users uu on uu.id=i.updated_by where i.id=?`).get(id) as InvoiceRow | undefined;
+    i.updated_at as updatedAt,i.updated_by as updatedBy,uu.display_name as updatedByName,
+    i.issued_at as issuedAt,i.issued_by as issuedBy,iu.display_name as issuedByName,i.row_version as rowVersion
+    from invoices i join users cu on cu.id=i.created_by join users uu on uu.id=i.updated_by
+    left join users iu on iu.id=i.issued_by where i.id=?`).get(id) as InvoiceRow | undefined;
 }
 
 function toDto(connection: DatabaseConnection, row: InvoiceRow): InvoiceDraftDto {
@@ -290,7 +319,11 @@ function toDto(connection: DatabaseConnection, row: InvoiceRow): InvoiceDraftDto
       refundedTotalMinor: row.refundedTotalMinor.toString(), netCollectedMinor: row.netCollectedMinor.toString(),
       remainingMinor: row.remainingMinor.toString() }, notes: row.notes, paymentTerms: row.paymentTerms,
     createdAt: row.createdAt, createdBy: { id: row.createdBy, displayName: row.createdByName },
-    updatedAt: row.updatedAt, updatedBy: { id: row.updatedBy, displayName: row.updatedByName }, rowVersion: Number(row.rowVersion),
+    updatedAt: row.updatedAt, updatedBy: { id: row.updatedBy, displayName: row.updatedByName },
+    issuedAt: row.issuedAt,
+    issuedBy: row.issuedBy && row.issuedByName ? { id: row.issuedBy, displayName: row.issuedByName } : null,
+    printSnapshot: readPrintSnapshot(connection, row.id),
+    rowVersion: Number(row.rowVersion),
   };
 }
 
@@ -382,6 +415,7 @@ export function updateInvoiceDraft(options: { id: string; input: unknown; actor:
   const connection = options.connection ?? getDatabase(); const at = options.now ?? new Date(); const now = at.toISOString();
   return withImmediateTransaction(connection.client, () => {
     const existing = getRequiredInvoice(connection, options.id);
+    if (existing.invoiceStatus === "ISSUED" && options.actor.role === "EMPLOYEE") throw forbiddenError();
     if (existing.rowVersion !== BigInt(request.rowVersion)) {
       throw conflictError({ rowVersion: existing.rowVersion.toString() });
     }
@@ -418,6 +452,199 @@ export function updateInvoiceDraft(options: { id: string; input: unknown; actor:
       actorUserId: options.actor.id, actorDisplayName: options.actor.displayName, invoiceId: options.id,
       invoiceNumber: existing.invoiceNumber, entityType: "INVOICE", entityId: options.id,
       summary: getMessages().audit.invoiceDraftUpdated, changes: invoiceChanges(before, after),
+      createdAt: now, requestId: options.requestId });
+    options.faultInjector?.("afterAudit");
+    return { invoice: after, warnings: dates.warnings };
+  });
+}
+
+function previousIssuedRequest(
+  connection: DatabaseConnection,
+  requestId: string,
+  actorId: string,
+  invoiceId?: string,
+): InvoiceDraftDto | null {
+  const row = connection.client.prepare(`select invoice_id as invoiceId from audit_logs
+    where request_id=? and actor_user_id=? and event_type='INVOICE_ISSUED'
+      and invoice_id is not null order by created_at,id limit 1`).get(requestId, actorId) as { invoiceId: string } | undefined;
+  if (!row || (invoiceId && row.invoiceId !== invoiceId)) return null;
+  const invoice = readInvoiceRow(connection, row.invoiceId);
+  return invoice?.invoiceStatus === "ISSUED" ? toDto(connection, invoice) : null;
+}
+
+function insertIssuedInvoice(options: {
+  connection: DatabaseConnection;
+  id: string;
+  invoiceNumber: string;
+  input: DraftInvoiceInput;
+  dates: { invoiceDate: string; dueDate: string | null };
+  beneficiary: PreparedBeneficiary | null;
+  beneficiaryId: string | null;
+  currency: { code: string; symbol: string; decimals: number };
+  total: CalculatedInvoice;
+  paymentTerms: string | null;
+  actorId: string;
+  now: string;
+}): void {
+  options.connection.client.prepare(`insert into invoices
+    (id,invoice_number,invoice_status,payment_status,is_archived,invoice_date,due_date,
+     beneficiary_id,beneficiary_name,beneficiary_phone,beneficiary_address,beneficiary_registration_number,
+     currency_code,currency_symbol,currency_decimals,tax_enabled,invoice_discount_kind,
+     subtotal_minor,line_discounts_minor,invoice_discount_minor,discount_total_minor,taxable_total_minor,
+     tax_total_minor,grand_total_minor,gross_paid_minor,refunded_total_minor,net_collected_minor,remaining_minor,
+     notes,payment_terms,created_at,created_by,updated_at,updated_by,issued_at,issued_by,row_version)
+    values (@id,@invoiceNumber,'ISSUED','UNPAID',0,@invoiceDate,@dueDate,@beneficiaryId,@beneficiaryName,
+      @beneficiaryPhone,@beneficiaryAddress,@beneficiaryRegistrationNumber,@currencyCode,@currencySymbol,
+      @currencyDecimals,0,'NONE',@subtotalMinor,@lineDiscountsMinor,@invoiceDiscountMinor,@discountTotalMinor,
+      @taxableTotalMinor,@taxTotalMinor,@grandTotalMinor,0,0,0,@remainingMinor,@notes,@paymentTerms,
+      @now,@actorId,@now,@actorId,@now,@actorId,1)`).run({
+        id: options.id,
+        invoiceNumber: options.invoiceNumber,
+        invoiceDate: options.dates.invoiceDate,
+        dueDate: options.dates.dueDate,
+        beneficiaryId: options.beneficiaryId,
+        beneficiaryName: options.beneficiary?.name ?? null,
+        beneficiaryPhone: options.beneficiary?.phone ?? null,
+        beneficiaryAddress: options.beneficiary?.address ?? null,
+        beneficiaryRegistrationNumber: options.beneficiary?.registrationNumber ?? null,
+        currencyCode: options.currency.code,
+        currencySymbol: options.currency.symbol,
+        currencyDecimals: options.currency.decimals,
+        subtotalMinor: BigInt(options.total.subtotalMinor),
+        lineDiscountsMinor: BigInt(options.total.lineDiscountsMinor),
+        invoiceDiscountMinor: BigInt(options.total.invoiceDiscountMinor),
+        discountTotalMinor: BigInt(options.total.discountTotalMinor),
+        taxableTotalMinor: BigInt(options.total.taxableTotalMinor),
+        taxTotalMinor: BigInt(options.total.taxTotalMinor),
+        grandTotalMinor: BigInt(options.total.grandTotalMinor),
+        remainingMinor: BigInt(options.total.remainingMinor),
+        notes: options.input.notes,
+        paymentTerms: options.paymentTerms,
+        now: options.now,
+        actorId: options.actorId,
+      });
+}
+
+function issuedAuditChanges(
+  before: InvoiceDraftDto | null,
+  after: InvoiceDraftDto,
+): Record<string, unknown> {
+  return {
+    ...(before ? invoiceChanges(before, after) : {}),
+    invoiceStatus: { before: before?.invoiceStatus ?? null, after: "ISSUED" },
+    issuedAt: { before: before?.issuedAt ?? null, after: after.issuedAt },
+  };
+}
+
+export function createIssuedInvoice(options: { input: unknown; actor: DraftActor; requestId: string;
+  connection?: DatabaseConnection; now?: Date; faultInjector?: FaultInjector; auditAppender?: AuditAppender;
+  snapshotCapturer?: SnapshotCapturer }): DraftResult {
+  let request;
+  try { request = parseCreateIssue(options.input); }
+  catch (error) { if (error instanceof DraftValidationError) throw validationError(error.fieldErrors); throw error; }
+  const connection = options.connection ?? getDatabase();
+  const at = options.now ?? new Date(); const now = at.toISOString();
+  return withImmediateTransaction(connection.client, () => {
+    const repeated = previousIssuedRequest(connection, options.requestId, options.actor.id);
+    if (repeated) return { invoice: repeated, warnings: [] };
+    const settings = settingsRow(connection, now);
+    const dates = validateDates(request.invoice, dateInTimezone(at, settings.timezone), settings.timezone,
+      at, options.actor.role, "issue");
+    const beneficiary = prepareBeneficiary(connection, request.invoice.beneficiary, "issue");
+    const items = prepareItems(connection, request.invoice.items, settings.currencyCode, "issue");
+    const currency = { code: settings.currencyCode, symbol: settings.currencySymbol,
+      decimals: Number(settings.currencyDecimals) };
+    const calculation = calculate(items, currency, "issue");
+    const reserved = reserveInvoiceNumber(connection, { prefix: settings.prefix, pattern: settings.pattern,
+      sequenceStart: settings.sequenceStart, resetPolicy: settings.resetPolicy, timezone: settings.timezone }, at);
+    options.faultInjector?.("afterSequence");
+    const beneficiaryId = persistBeneficiary(connection, beneficiary, options.actor.id, now);
+    persistProducts(connection, items, currency.code, options.actor.id, now);
+    options.faultInjector?.("afterSuggestions");
+    const id = ulid();
+    insertIssuedInvoice({ connection, id, invoiceNumber: reserved.invoiceNumber, input: request.invoice,
+      dates, beneficiary, beneficiaryId, currency, total: calculation.calculated,
+      paymentTerms: request.invoice.paymentTerms === undefined ? settings.defaultPaymentTerms : request.invoice.paymentTerms,
+      actorId: options.actor.id, now });
+    options.faultInjector?.("afterInvoice");
+    insertItems(connection, id, items, calculation.lineCalculations, now);
+    options.faultInjector?.("afterItems");
+    (options.snapshotCapturer ?? capturePrintSnapshot)(connection, { invoiceId: id, capturedAt: now });
+    options.faultInjector?.("afterSnapshot");
+    options.faultInjector?.("afterStatus");
+    const after = toDto(connection, getRequiredInvoice(connection, id));
+    const append = options.auditAppender ?? appendAuditEvent;
+    append(connection, { eventType: "INVOICE_CREATED", actorUserId: options.actor.id,
+      actorDisplayName: options.actor.displayName, invoiceId: id, invoiceNumber: reserved.invoiceNumber,
+      entityType: "INVOICE", entityId: id, summary: getMessages().audit.invoiceCreatedIssued,
+      changes: { invoiceStatus: { before: null, after: "ISSUED" } }, createdAt: now, requestId: options.requestId });
+    append(connection, { eventType: "INVOICE_ISSUED", actorUserId: options.actor.id,
+      actorDisplayName: options.actor.displayName, invoiceId: id, invoiceNumber: reserved.invoiceNumber,
+      entityType: "INVOICE", entityId: id, summary: getMessages().audit.invoiceIssued,
+      changes: issuedAuditChanges(null, after), createdAt: now, requestId: options.requestId });
+    options.faultInjector?.("afterAudit");
+    return { invoice: after, warnings: dates.warnings };
+  });
+}
+
+export function issueInvoiceDraft(options: { id: string; input: unknown; actor: DraftActor; requestId: string;
+  connection?: DatabaseConnection; now?: Date; faultInjector?: FaultInjector; auditAppender?: AuditAppender;
+  snapshotCapturer?: SnapshotCapturer }): DraftResult {
+  let request;
+  try { request = parseUpdateIssue(options.input); }
+  catch (error) { if (error instanceof DraftValidationError) throw validationError(error.fieldErrors); throw error; }
+  const connection = options.connection ?? getDatabase();
+  const at = options.now ?? new Date(); const now = at.toISOString();
+  return withImmediateTransaction(connection.client, () => {
+    const repeated = previousIssuedRequest(connection, options.requestId, options.actor.id, options.id);
+    if (repeated) return { invoice: repeated, warnings: [] };
+    const existing = getRequiredInvoice(connection, options.id);
+    if (existing.rowVersion !== BigInt(request.rowVersion)) {
+      throw conflictError({ rowVersion: existing.rowVersion.toString() });
+    }
+    if (existing.invoiceStatus !== "DRAFT" || existing.isArchived === 1n) throw conflictError();
+    const before = toDto(connection, existing);
+    const settings = settingsRow(connection, now);
+    const dates = validateDates(request.invoice, existing.invoiceDate, settings.timezone, at, options.actor.role, "issue");
+    const beneficiary = prepareBeneficiary(connection, request.invoice.beneficiary, "issue");
+    const items = prepareItems(connection, request.invoice.items, existing.currencyCode, "issue");
+    const calculation = calculate(items, { code: existing.currencyCode, symbol: existing.currencySymbol,
+      decimals: Number(existing.currencyDecimals) }, "issue");
+    const beneficiaryId = persistBeneficiary(connection, beneficiary, options.actor.id, now);
+    persistProducts(connection, items, existing.currencyCode, options.actor.id, now);
+    options.faultInjector?.("afterSuggestions");
+    const total = calculation.calculated;
+    const paymentTerms = request.invoice.paymentTerms === undefined ? existing.paymentTerms : request.invoice.paymentTerms;
+    const updated = connection.client.prepare(`update invoices set invoice_date=?,due_date=?,beneficiary_id=?,
+      beneficiary_name=?,beneficiary_phone=?,beneficiary_address=?,beneficiary_registration_number=?,
+      subtotal_minor=?,line_discounts_minor=?,invoice_discount_minor=?,discount_total_minor=?,taxable_total_minor=?,
+      tax_total_minor=?,grand_total_minor=?,remaining_minor=?,notes=?,payment_terms=?,updated_at=?,updated_by=?,
+      row_version=row_version+1
+      where id=? and row_version=? and invoice_status='DRAFT' and is_archived=0`).run(
+        dates.invoiceDate, dates.dueDate, beneficiaryId, beneficiary?.name ?? null, beneficiary?.phone ?? null,
+        beneficiary?.address ?? null, beneficiary?.registrationNumber ?? null, BigInt(total.subtotalMinor),
+        BigInt(total.lineDiscountsMinor), BigInt(total.invoiceDiscountMinor), BigInt(total.discountTotalMinor),
+        BigInt(total.taxableTotalMinor), BigInt(total.taxTotalMinor), BigInt(total.grandTotalMinor),
+        BigInt(total.remainingMinor), request.invoice.notes, paymentTerms, now, options.actor.id,
+        options.id, request.rowVersion);
+    if (updated.changes !== 1) throw conflictError();
+    options.faultInjector?.("afterInvoice");
+    connection.client.prepare("delete from invoice_items where invoice_id=?").run(options.id);
+    insertItems(connection, options.id, items, calculation.lineCalculations, now);
+    options.faultInjector?.("afterItems");
+    (options.snapshotCapturer ?? capturePrintSnapshot)(connection, { invoiceId: options.id, capturedAt: now });
+    options.faultInjector?.("afterSnapshot");
+    const issued = connection.client.prepare(`update invoices set invoice_status='ISSUED',issued_at=?,issued_by=?
+      where id=? and row_version=? and invoice_status='DRAFT' and is_archived=0`).run(
+        now, options.actor.id, options.id, request.rowVersion + 1,
+      );
+    if (issued.changes !== 1) throw conflictError();
+    options.faultInjector?.("afterStatus");
+    const after = toDto(connection, getRequiredInvoice(connection, options.id));
+    (options.auditAppender ?? appendAuditEvent)(connection, { eventType: "INVOICE_ISSUED",
+      actorUserId: options.actor.id, actorDisplayName: options.actor.displayName, invoiceId: options.id,
+      invoiceNumber: existing.invoiceNumber, entityType: "INVOICE", entityId: options.id,
+      summary: getMessages().audit.invoiceIssued, changes: issuedAuditChanges(before, after),
       createdAt: now, requestId: options.requestId });
     options.faultInjector?.("afterAudit");
     return { invoice: after, warnings: dates.warnings };

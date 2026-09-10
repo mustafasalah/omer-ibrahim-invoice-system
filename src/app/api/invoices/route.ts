@@ -1,18 +1,24 @@
 import { NextResponse } from "next/server";
 import { requireCsrfProtection } from "@/server/auth/csrf";
-import { requireCapability } from "@/server/auth/sessions";
+import { assertCapability, requireSession } from "@/server/auth/sessions";
+import { readInvoiceIntent } from "@/domain/invoices/draft";
 import { readJsonBody } from "@/server/http/json";
+import { validationError } from "@/server/http/errors";
 import { withApiHandler } from "@/server/http/route";
-import { createInvoiceDraft } from "@/server/invoices/service";
+import { createInvoiceDraft, createIssuedInvoice } from "@/server/invoices/service";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 export const POST = withApiHandler(async ({ request, requestId }) => {
   requireCsrfProtection(request);
-  const session = requireCapability(request, "invoice.create");
-  const result = createInvoiceDraft({
-    input: await readJsonBody(request),
+  const session = requireSession(request);
+  const input = await readJsonBody(request);
+  const intent = readInvoiceIntent(input);
+  if (!intent) throw validationError({ intent: "INVALID_INTENT" });
+  assertCapability(session, intent === "ISSUE" ? "invoice.issue" : "invoice.create");
+  const result = (intent === "ISSUE" ? createIssuedInvoice : createInvoiceDraft)({
+    input,
     actor: { id: session.user.id, displayName: session.user.displayName, role: session.user.role },
     requestId,
   });

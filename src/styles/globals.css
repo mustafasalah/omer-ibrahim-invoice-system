@@ -955,6 +955,20 @@ button:disabled {
   min-width: min(240px, 100%);
 }
 
+.invoice-save-bar__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.invoice-save-bar .button-secondary,
+.invoice-dialog .button-secondary {
+  color: var(--brand-900);
+  border: 1px solid var(--brand-600);
+  background: white;
+}
+
 .invoice-notice,
 .copy-fallback {
   margin-block-end: 16px;
@@ -965,6 +979,58 @@ button:disabled {
 .invoice-notice--success { color: var(--brand-900); background: var(--brand-100); }
 .invoice-notice--warning { color: #684b08; background: #fff4cc; }
 .invoice-notice--error { color: #842f32; background: #fff1f1; border: 1px solid #e5b6b8; }
+
+.invoice-error-summary {
+  margin-block-end: 16px;
+  padding: 16px 18px;
+  border: 2px solid #a63d40;
+  border-radius: 12px;
+  color: #6f282b;
+  background: #fff1f1;
+}
+
+.invoice-error-summary:focus-visible {
+  outline: 3px solid rgb(166 61 64 / 30%);
+  outline-offset: 3px;
+}
+
+.invoice-error-summary ul {
+  margin: 10px 0 0;
+  padding-inline-start: 22px;
+}
+
+.invoice-error-summary button {
+  min-height: 36px;
+  padding: 2px 0;
+  border: 0;
+  color: #6f282b;
+  background: transparent;
+  text-align: start;
+  text-decoration: underline;
+}
+
+.invoice-dialog-backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(7 26 25 / 58%);
+}
+
+.invoice-dialog {
+  width: min(100%, 520px);
+  padding: clamp(22px, 5vw, 32px);
+  border-radius: 18px;
+  background: white;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 25%);
+}
+
+.invoice-dialog h2 { margin: 0; }
+.invoice-dialog p { margin: 12px 0 0; color: var(--ink-600); }
+.invoice-dialog__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; margin-block-start: 24px; }
+.invoice-dialog__actions button { min-height: 46px; padding-inline: 18px; border: 0; border-radius: 10px; color: white; background: var(--brand-900); font-weight: 750; }
 
 .invoice-conflict {
   position: fixed;
@@ -1099,6 +1165,7 @@ button:disabled {
     flex-direction: column;
   }
 
+  .invoice-save-bar__actions { display: grid; width: 100%; }
   .invoice-save-bar button { width: 100%; }
 
   .invoice-conflict {

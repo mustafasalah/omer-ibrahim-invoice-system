@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 test("setup → login → settings → create and edit draft → logout", async ({ page, request }) => {
+  test.setTimeout(60_000);
   await page.goto("/");
   await expect(page).toHaveURL(/\/setup$/);
   await expect(page.locator("html")).toHaveAttribute("lang", "ar");
@@ -57,6 +58,50 @@ test("setup → login → settings → create and edit draft → logout", async 
   await expect(page.getByText("لم تُحفظ بعد", { exact: true })).toBeVisible();
   await expect(page.locator("main")).toHaveAttribute("data-row-version", "unsaved");
 
+  const issueButton = page.getByRole("button", { name: "إصدار الفاتورة" });
+  await expect(issueButton).toBeEnabled();
+  await issueButton.click();
+  const issueDialog = page.getByRole("dialog", { name: "تأكيد إصدار الفاتورة" });
+  await expect(issueDialog).toContainText("ستصبح الفاتورة رسمية");
+  await expect(issueDialog.getByRole("button", { name: "العودة إلى المحرر" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(issueDialog).toBeHidden();
+  await expect(issueButton).toBeFocused();
+  await issueButton.click();
+  await issueDialog.getByRole("button", { name: "تأكيد الإصدار" }).click();
+  const issueErrors = page.locator(".invoice-error-summary");
+  await expect(issueErrors).toBeFocused();
+  await expect(issueErrors).toContainText("تعذر إصدار الفاتورة");
+  await expect(page).toHaveURL(/\/invoices\/new$/);
+  await expect(page.getByText("لم تُحفظ بعد", { exact: true })).toBeVisible();
+  await issueErrors.getByRole("button").first().click();
+  await expect(page.getByLabel("اسم المستفيد")).toBeFocused();
+
+  await page.getByLabel("اسم المستفيد").fill("مستشفى الإصدار المباشر");
+  await page.getByLabel("اسم المنتج").fill("عينة مباشرة");
+  await page.getByLabel("الكمية").fill("1");
+  await page.getByLabel("سعر الوحدة").fill("0");
+  await page.route("**/api/invoices", async (route) => {
+    if (route.request().method() === "POST" && (route.request().postDataJSON() as { intent?: string }).intent === "ISSUE") {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    await route.continue();
+  }, { times: 1 });
+  await issueButton.click();
+  await issueDialog.getByRole("button", { name: "تأكيد الإصدار" }).click();
+  await expect(page.getByRole("button", { name: "جارٍ إصدار الفاتورة…" })).toBeDisabled();
+  await expect(page).toHaveURL(/\/invoices\/[0-9A-HJKMNP-TV-Z]{26}\/edit$/u);
+  await expect(page.getByText("صادرة", { exact: true })).toBeVisible();
+  await expect(page.locator(".invoice-state-page [role='alert']")).toContainText("هذه الفاتورة صادرة");
+  const directId = /\/invoices\/([^/]+)\/edit/u.exec(new URL(page.url()).pathname)?.[1];
+  const directResponse = await page.request.get(`/api/invoices/${directId}`);
+  await expect(directResponse.json()).resolves.toMatchObject({ invoice: { invoiceStatus: "ISSUED", rowVersion: 1,
+    totals: { grandTotalMinor: "0", remainingMinor: "0" }, printSnapshot: { capturedAt: expect.any(String) } } });
+
+  await page.getByRole("link", { name: "العودة إلى لوحة التحكم" }).click();
+  await page.getByRole("link", { name: "إنشاء فاتورة جديدة" }).click();
+  await expect(page).toHaveURL(/\/invoices\/new$/);
+
   await page.getByLabel("اسم المستفيد").fill("مستشفى الأمل");
   const productNames = page.getByLabel("اسم المنتج");
   const quantities = page.getByLabel("الكمية");
@@ -99,12 +144,13 @@ test("setup → login → settings → create and edit draft → logout", async 
 
   const notes = page.getByRole("textbox", { name: /^ملاحظات/u });
   await notes.fill("مدخلاتي وقت التعارض");
-  await page.route(`**/api/invoices/${invoiceId}`, async (route) => {
+  await page.route(`**/api/invoices/${invoiceId}/issue`, async (route) => {
     await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({
       error: { code: "CONFLICT", message: "توجد نسخة أحدث.", fieldErrors: { rowVersion: "3" }, requestId: "e2e-conflict" },
     }) });
   }, { times: 1 });
-  await page.getByRole("button", { name: "حفظ كمسودة" }).click();
+  await page.getByRole("button", { name: "إصدار الفاتورة" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "تأكيد الإصدار" }).click();
   await expect(page.getByRole("alertdialog")).toContainText("توجد نسخة أحدث");
   await page.getByRole("button", { name: "نسخ مدخلاتي" }).click();
   page.once("dialog", (prompt) => void prompt.accept());
@@ -120,6 +166,7 @@ test("setup → login → settings → create and edit draft → logout", async 
 
   await page.evaluate(() => { document.documentElement.style.zoom = "2"; });
   await expect(page.getByRole("button", { name: "حفظ كمسودة" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "إصدار الفاتورة" })).toBeVisible();
   await page.evaluate(() => { document.documentElement.style.zoom = "1"; });
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.locator(".invoice-item").first()).toBeVisible();
@@ -134,7 +181,20 @@ test("setup → login → settings → create and edit draft → logout", async 
   expect(await dialog).toBe("confirm");
   await expect(page).toHaveURL(/\/invoices\/[^/]+\/edit/u);
   await notes.fill("حفظ بلوحة المفاتيح");
-  await page.getByRole("link", { name: "لوحة التحكم", exact: true }).click();
+  await quantities.nth(1).fill("2");
+  await prices.nth(1).fill("5");
+  const existingIssue = page.waitForResponse((response) => response.url().endsWith(`/api/invoices/${invoiceId}/issue`) && response.request().method() === "POST");
+  await page.getByRole("button", { name: "إصدار الفاتورة" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "تأكيد الإصدار" }).click();
+  expect((await existingIssue).ok()).toBe(true);
+  await expect(page.getByText("صادرة", { exact: true })).toBeVisible();
+  await expect(page.getByText(invoiceNumber, { exact: true })).toBeVisible();
+  await page.reload();
+  await expect(page.locator(".invoice-state-page [role='alert']")).toContainText("هذه الفاتورة صادرة");
+  const issuedResponse = await page.request.get(`/api/invoices/${invoiceId}`);
+  await expect(issuedResponse.json()).resolves.toMatchObject({ invoice: { invoiceStatus: "ISSUED", rowVersion: 4,
+    items: [{ quantity: "2.5" }, { quantity: "2", unitPrice: "5" }], printSnapshot: { capturedAt: expect.any(String) } } });
+  await page.getByRole("link", { name: "العودة إلى لوحة التحكم" }).click();
 
   await page.getByRole("button", { name: "تسجيل الخروج", exact: true }).click();
   await expect(page).toHaveURL(/\/login$/);

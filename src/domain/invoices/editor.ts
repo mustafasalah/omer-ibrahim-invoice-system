@@ -55,7 +55,12 @@ const invoiceDtoSchema = z.object({
     grossPaidMinor: z.string(), refundedTotalMinor: z.string(), netCollectedMinor: z.string(), remainingMinor: z.string() }),
   notes: z.string().nullable(), paymentTerms: z.string().nullable(), createdAt: z.string(),
   createdBy: z.object({ id: z.string(), displayName: z.string() }), updatedAt: z.string(),
-  updatedBy: z.object({ id: z.string(), displayName: z.string() }), rowVersion: z.number().int().min(1),
+  updatedBy: z.object({ id: z.string(), displayName: z.string() }), issuedAt: z.string().nullable(),
+  issuedBy: z.object({ id: z.string(), displayName: z.string() }).nullable(),
+  printSnapshot: z.object({ companyNameAr: z.string(), companyNameEn: z.string(), address: z.string().nullable(),
+    phones: z.array(z.string()), email: z.string().nullable(), registrationNumber: z.string().nullable(),
+    footerText: z.string().nullable(), paperFormat: z.enum(["A4", "A5"]), capturedAt: z.string() }).nullable(),
+  rowVersion: z.number().int().min(1),
 });
 
 export function emptyEditorItem(clientKey: string): EditorItem {
@@ -154,6 +159,19 @@ export function toDraftInput(state: InvoiceEditorState): DraftInvoiceInput {
     name: text(state.beneficiary.name), phone: text(state.beneficiary.phone), address: text(state.beneficiary.address),
     registrationNumber: text(state.beneficiary.registrationNumber), updateSuggestion: false, reactivateSuggestion: false },
     items: persistedItems.map((item) => ({ clientKey: item.clientKey,
+      ...(item.productSuggestionId ? { productSuggestionId: item.productSuggestionId } : {}),
+      productName: text(item.productName), description: text(item.description), unit: text(item.unit),
+      quantity: text(item.quantity), unitPrice: text(item.unitPrice), updateSuggestion: false, reactivateSuggestion: false })),
+    notes: text(state.notes), paymentTerms: text(state.paymentTerms) };
+}
+
+export function toIssueInput(state: InvoiceEditorState): DraftInvoiceInput {
+  const text = (value: string) => value === "" ? null : value;
+  return { invoiceDate: state.invoiceDate, dueDate: text(state.dueDate), beneficiary: {
+    ...(state.beneficiary.suggestionId ? { suggestionId: state.beneficiary.suggestionId } : {}),
+    name: text(state.beneficiary.name), phone: text(state.beneficiary.phone), address: text(state.beneficiary.address),
+    registrationNumber: text(state.beneficiary.registrationNumber), updateSuggestion: false, reactivateSuggestion: false },
+    items: state.items.map((item) => ({ clientKey: item.clientKey,
       ...(item.productSuggestionId ? { productSuggestionId: item.productSuggestionId } : {}),
       productName: text(item.productName), description: text(item.description), unit: text(item.unit),
       quantity: text(item.quantity), unitPrice: text(item.unitPrice), updateSuggestion: false, reactivateSuggestion: false })),

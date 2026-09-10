@@ -43,6 +43,20 @@ export type DraftInvoiceInput = {
 
 export type CreateDraftRequest = { intent: "SAVE_DRAFT"; invoice: DraftInvoiceInput };
 export type UpdateDraftRequest = { rowVersion: number; invoice: DraftInvoiceInput };
+export type CreateIssueRequest = { intent: "ISSUE"; invoice: DraftInvoiceInput };
+export type UpdateIssueRequest = { rowVersion: number; invoice: DraftInvoiceInput };
+
+export type PrintSnapshotDto = {
+  companyNameAr: string;
+  companyNameEn: string;
+  address: string | null;
+  phones: string[];
+  email: string | null;
+  registrationNumber: string | null;
+  footerText: string | null;
+  paperFormat: "A4" | "A5";
+  capturedAt: string;
+};
 
 export type InvoiceEditorDefaults = {
   invoiceDate: string;
@@ -66,7 +80,10 @@ export type InvoiceDraftDto = {
     grossPaidMinor: string; refundedTotalMinor: string; netCollectedMinor: string; remainingMinor: string };
   notes: string | null; paymentTerms: string | null;
   createdAt: string; createdBy: { id: string; displayName: string };
-  updatedAt: string; updatedBy: { id: string; displayName: string }; rowVersion: number;
+  updatedAt: string; updatedBy: { id: string; displayName: string };
+  issuedAt: string | null; issuedBy: { id: string; displayName: string } | null;
+  printSnapshot: PrintSnapshotDto | null;
+  rowVersion: number;
 };
 
 export type DraftResult = {
@@ -117,6 +134,8 @@ const invoiceSchema = z.object({
 
 const createSchema = z.object({ intent: z.literal("SAVE_DRAFT"), invoice: invoiceSchema }).strict();
 const updateSchema = z.object({ rowVersion: z.number().int().min(1), invoice: invoiceSchema }).strict();
+const createIssueSchema = z.object({ intent: z.literal("ISSUE"), invoice: invoiceSchema }).strict();
+const updateIssueSchema = z.object({ rowVersion: z.number().int().min(1), invoice: invoiceSchema }).strict();
 
 function cleanText(value: string | null | undefined): string | null {
   if (value === undefined || value === null) return null;
@@ -136,9 +155,10 @@ function addClientKeyError(
   index: number,
   field: "quantity" | "unitPrice",
   message: string,
+  prefix = "invoice.",
 ): void {
-  fields[`invoice.items.${index}.${field}`] = message;
-  if (item.clientKey) fields[`invoice.itemsByClientKey.${item.clientKey}.${field}`] = message;
+  fields[`${prefix}items.${index}.${field}`] = message;
+  if (item.clientKey) fields[`${prefix}itemsByClientKey.${item.clientKey}.${field}`] = message;
 }
 
 function normalizeInvoice(raw: z.infer<typeof invoiceSchema>): DraftInvoiceInput {
@@ -170,7 +190,7 @@ function normalizeInvoice(raw: z.infer<typeof invoiceSchema>): DraftInvoiceInput
   };
 }
 
-function validateDecimals(invoice: DraftInvoiceInput): void {
+function collectDecimalErrors(invoice: DraftInvoiceInput, prefix = "invoice."): Record<string, string> {
   const fields: Record<string, string> = {};
   invoice.items.forEach((item, index) => {
     for (const field of ["quantity", "unitPrice"] as const) {
@@ -178,13 +198,39 @@ function validateDecimals(invoice: DraftInvoiceInput): void {
       const inspection = inspectDecimalInput(item[field], field);
       if (inspection.state !== "valid") {
         const message = inspection.state === "malformed" ? inspection.code : "INVALID_DECIMAL";
-        addClientKeyError(fields, item, index, field, message);
+        addClientKeyError(fields, item, index, field, message, prefix);
       } else {
         item[field] = inspection.value as DecimalString;
       }
     }
   });
+  return fields;
+}
+
+function validateDecimals(invoice: DraftInvoiceInput, prefix = "invoice."): void {
+  const fields = collectDecimalErrors(invoice, prefix);
   if (Object.keys(fields).length > 0) throw new DraftValidationError(fields);
+}
+
+function collectIssueRequiredErrors(invoice: DraftInvoiceInput): Record<string, string> {
+  const fields: Record<string, string> = {};
+  if (!invoice.beneficiary?.name) fields["beneficiary.name"] = "REQUIRED";
+  if (invoice.items.length === 0) fields.items = "AT_LEAST_ONE_COMPLETE_ITEM_REQUIRED";
+  let completeCount = 0;
+  invoice.items.forEach((item, index) => {
+    if (!item.productName) fields[`items.${index}.productName`] = "REQUIRED";
+    if (item.quantity === null) fields[`items.${index}.quantity`] = "DECIMAL_REQUIRED";
+    if (item.unitPrice === null) fields[`items.${index}.unitPrice`] = "DECIMAL_REQUIRED";
+    if (item.productName && item.quantity !== null && item.unitPrice !== null) completeCount += 1;
+    if (item.clientKey) {
+      for (const field of ["productName", "quantity", "unitPrice"] as const) {
+        const value = fields[`items.${index}.${field}`];
+        if (value) fields[`itemsByClientKey.${item.clientKey}.${field}`] = value;
+      }
+    }
+  });
+  if (completeCount === 0) fields.items ??= "AT_LEAST_ONE_COMPLETE_ITEM_REQUIRED";
+  return fields;
 }
 
 export function parseCreateDraft(input: unknown): CreateDraftRequest {
@@ -201,6 +247,83 @@ export function parseUpdateDraft(input: unknown): UpdateDraftRequest {
   const invoice = normalizeInvoice(parsed.data.invoice);
   validateDecimals(invoice);
   return { rowVersion: parsed.data.rowVersion, invoice };
+}
+
+function issueFields(issues: readonly z.core.$ZodIssue[]): Record<string, string> {
+  const fields = issuesToFields(issues);
+  return Object.fromEntries(Object.entries(fields).map(([path, message]) => [
+    path.startsWith("invoice.") ? path.slice("invoice.".length) : path,
+    message,
+  ]));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function collectRawIssueErrors(input: unknown): Record<string, string> {
+  const fields: Record<string, string> = {};
+  if (!isRecord(input) || !isRecord(input.invoice)) return fields;
+  const raw = input.invoice;
+  const beneficiary = isRecord(raw.beneficiary) ? raw.beneficiary : null;
+  if (typeof beneficiary?.name !== "string" || cleanText(beneficiary.name) === null) {
+    fields["beneficiary.name"] = "REQUIRED";
+  }
+  if (!Array.isArray(raw.items) || raw.items.length === 0) {
+    fields.items = "AT_LEAST_ONE_COMPLETE_ITEM_REQUIRED";
+    return fields;
+  }
+  let completeCount = 0;
+  raw.items.forEach((value, index) => {
+    const item = isRecord(value) ? value : {};
+    const productComplete = typeof item.productName === "string" && cleanText(item.productName) !== null;
+    const quantity = inspectDecimalInput(item.quantity ?? "", "quantity");
+    const unitPrice = inspectDecimalInput(item.unitPrice ?? "", "unitPrice");
+    if (!productComplete) fields[`items.${index}.productName`] = "REQUIRED";
+    if (quantity.state !== "valid") fields[`items.${index}.quantity`] = quantity.state === "empty"
+      ? "DECIMAL_REQUIRED" : quantity.state === "incomplete" ? "DECIMAL_INCOMPLETE" : quantity.code;
+    if (unitPrice.state !== "valid") fields[`items.${index}.unitPrice`] = unitPrice.state === "empty"
+      ? "DECIMAL_REQUIRED" : unitPrice.state === "incomplete" ? "DECIMAL_INCOMPLETE" : unitPrice.code;
+    if (productComplete && quantity.state === "valid" && unitPrice.state === "valid") completeCount += 1;
+    if (typeof item.clientKey === "string" && item.clientKey) {
+      for (const field of ["productName", "quantity", "unitPrice"] as const) {
+        const message = fields[`items.${index}.${field}`];
+        if (message) fields[`itemsByClientKey.${item.clientKey}.${field}`] = message;
+      }
+    }
+  });
+  if (completeCount === 0) fields.items = "AT_LEAST_ONE_COMPLETE_ITEM_REQUIRED";
+  return fields;
+}
+
+export function parseCreateIssue(input: unknown): CreateIssueRequest {
+  const parsed = createIssueSchema.safeParse(input);
+  if (!parsed.success) throw new DraftValidationError({
+    ...collectRawIssueErrors(input),
+    ...issueFields(parsed.error.issues),
+  });
+  const invoice = normalizeInvoice(parsed.data.invoice);
+  const fields = { ...collectIssueRequiredErrors(invoice), ...collectDecimalErrors(invoice, "") };
+  if (Object.keys(fields).length > 0) throw new DraftValidationError(fields);
+  return { intent: "ISSUE", invoice };
+}
+
+export function parseUpdateIssue(input: unknown): UpdateIssueRequest {
+  const parsed = updateIssueSchema.safeParse(input);
+  if (!parsed.success) throw new DraftValidationError({
+    ...collectRawIssueErrors(input),
+    ...issueFields(parsed.error.issues),
+  });
+  const invoice = normalizeInvoice(parsed.data.invoice);
+  const fields = { ...collectIssueRequiredErrors(invoice), ...collectDecimalErrors(invoice, "") };
+  if (Object.keys(fields).length > 0) throw new DraftValidationError(fields);
+  return { rowVersion: parsed.data.rowVersion, invoice };
+}
+
+export function readInvoiceIntent(input: unknown): "SAVE_DRAFT" | "ISSUE" | null {
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
+  const intent = (input as Record<string, unknown>).intent;
+  return intent === "SAVE_DRAFT" || intent === "ISSUE" ? intent : null;
 }
 
 export function normalizeSuggestionName(value: string): string {

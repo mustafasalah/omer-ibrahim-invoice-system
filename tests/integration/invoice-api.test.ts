@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { GET as getCsrf } from "@/app/api/auth/csrf/route";
 import { POST } from "@/app/api/invoices/route";
 import { GET, PATCH } from "@/app/api/invoices/[id]/route";
+import { POST as ISSUE } from "@/app/api/invoices/[id]/issue/route";
 import { createSessionToken, insertSession } from "@/server/auth/sessions";
 import { apiErrorCodes } from "@/server/http/errors";
 import { createTestAdmin } from "../fixtures/auth";
@@ -58,6 +59,10 @@ describe("invoice draft API", () => {
     const admin = await createTestAdmin(temporary.connection); const token = createSessionToken();
     insertSession({ connection: temporary.connection, user: admin, token, now: new Date() });
     const authCookie = `oims_session=${token}`; const csrfData = await csrf();
+    const unauthenticated = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+      intent: "ISSUE", invoice: {},
+    }, "", csrfData.token, csrfData.cookie));
+    expect(unauthenticated.status).toBe(401);
     const createdResponse = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
       intent: "SAVE_DRAFT", invoice: { beneficiary: { name: "عميل" },
         items: [{ clientKey: "one", productName: "منتج", quantity: "2", unitPrice: "5" }] },
@@ -100,5 +105,93 @@ describe("invoice draft API", () => {
     }));
     expect(malformed.status).toBe(422);
     expect(JSON.stringify(await malformed.json())).not.toMatch(/sqlite|select|\\|service\.ts/iu);
+  });
+
+  it("issues directly and from a draft with CSRF, strict input, safe DTOs, and idempotent request IDs", async () => {
+    temporary = createTemporaryDatabase(); globalThis.__oimsDatabaseConnection = temporary.connection;
+    const admin = await createTestAdmin(temporary.connection); const token = createSessionToken();
+    insertSession({ connection: temporary.connection, user: admin, token, now: new Date() });
+    const authCookie = `oims_session=${token}`; const csrfData = await csrf();
+    const invoice = { invoiceDate: "2026-08-27", beneficiary: { name: "عميل API" },
+      items: [{ productName: "منتج API", quantity: "2", unitPrice: "3" }] };
+    const forged = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+      intent: "ISSUE", invoice: { ...invoice, grandTotalMinor: "1" },
+    }, authCookie, csrfData.token, csrfData.cookie));
+    expect(forged.status).toBe(422);
+    expect((temporary.connection.client.prepare("select count(*) as count from invoices").get() as { count: bigint }).count).toBe(0n);
+
+    const issuedResponse = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+      intent: "ISSUE", invoice,
+    }, authCookie, csrfData.token, csrfData.cookie));
+    expect(issuedResponse.status).toBe(201);
+    const issued = await issuedResponse.json() as { invoice: { id: string; invoiceNumber: string; invoiceStatus: string;
+      issuedAt: string; issuedBy: { id: string }; printSnapshot: { companyNameAr: string; capturedAt: string } } };
+    expect(issued.invoice).toMatchObject({ invoiceStatus: "ISSUED", issuedBy: { id: admin.id },
+      printSnapshot: { capturedAt: issued.invoice.issuedAt } });
+    expect(JSON.stringify(issued)).not.toMatch(/assetId|relativePath|phonesJson|sql|changesJson/iu);
+    const retryResponse = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+      intent: "ISSUE", invoice,
+    }, authCookie, csrfData.token, csrfData.cookie));
+    await expect(retryResponse.json()).resolves.toMatchObject({ invoice: { id: issued.invoice.id } });
+    expect((temporary.connection.client.prepare("select count(*) as count from invoices").get() as { count: bigint }).count).toBe(1n);
+
+    const draftResponse = await POST(new Request("http://127.0.0.1:3000/api/invoices", {
+      method: "POST", headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000",
+        "sec-fetch-site": "same-origin", "content-type": "application/json", cookie: `${authCookie}; ${csrfData.cookie}`,
+        "x-csrf-token": csrfData.token, "x-request-id": "draft-api-create" },
+      body: JSON.stringify({ intent: "SAVE_DRAFT", invoice: {} }),
+    }));
+    const draftCreated = await draftResponse.json() as { invoice: { id: string; rowVersion: number } };
+    const noCsrf = await ISSUE(new Request(`http://127.0.0.1:3000/api/invoices/${draftCreated.invoice.id}/issue`, {
+      method: "POST", headers: { cookie: authCookie, "content-type": "application/json" }, body: "{}",
+    }));
+    expect(noCsrf.status).toBe(403);
+    const missing = await ISSUE(request("http://127.0.0.1:3000/api/invoices/01K00000000000000000000000/issue", "POST", {
+      rowVersion: 1, invoice,
+    }, authCookie, csrfData.token, csrfData.cookie));
+    expect(missing.status).toBe(404);
+    expect(JSON.stringify(await missing.json())).not.toMatch(/sqlite|select|service\.ts|\\/iu);
+    const incomplete = await ISSUE(request(`http://127.0.0.1:3000/api/invoices/${draftCreated.invoice.id}/issue`, "POST", {
+      rowVersion: 1, invoice: { beneficiary: { name: "" }, items: [{ productName: "", quantity: "", unitPrice: "" }] },
+    }, authCookie, csrfData.token, csrfData.cookie));
+    expect(incomplete.status).toBe(422);
+    await expect(incomplete.json()).resolves.toMatchObject({ error: { fieldErrors: {
+      "beneficiary.name": "REQUIRED", "items.0.productName": "REQUIRED",
+      "items.0.quantity": "DECIMAL_REQUIRED", "items.0.unitPrice": "DECIMAL_REQUIRED",
+    } } });
+    const existingIssued = await ISSUE(request(`http://127.0.0.1:3000/api/invoices/${draftCreated.invoice.id}/issue`, "POST", {
+      rowVersion: 1, invoice,
+    }, authCookie, csrfData.token, csrfData.cookie));
+    expect(existingIssued.status).toBe(200);
+    await expect(existingIssued.json()).resolves.toMatchObject({ invoice: { invoiceStatus: "ISSUED", rowVersion: 2 } });
+  });
+
+  it("returns 403 when an employee calls draft PATCH after issue (AT-AUTH-007)", async () => {
+    temporary = createTemporaryDatabase(); globalThis.__oimsDatabaseConnection = temporary.connection;
+    const admin = await createTestAdmin(temporary.connection); const adminToken = createSessionToken();
+    insertSession({ connection: temporary.connection, user: admin, token: adminToken, now: new Date() });
+    const csrfData = await csrf(); const adminCookie = `oims_session=${adminToken}`;
+    const body = { invoiceDate: "2026-08-27", beneficiary: { name: "مستفيد" },
+      items: [{ productName: "منتج", quantity: "1", unitPrice: "1" }] };
+    const createdResponse = await POST(new Request("http://127.0.0.1:3000/api/invoices", { method: "POST",
+      headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000", "sec-fetch-site": "same-origin",
+        "content-type": "application/json", cookie: `${adminCookie}; ${csrfData.cookie}`, "x-csrf-token": csrfData.token,
+        "x-request-id": "auth7-create" }, body: JSON.stringify({ intent: "ISSUE", invoice: body }) }));
+    const created = await createdResponse.json() as { invoice: { id: string; rowVersion: number } };
+    const at = new Date().toISOString();
+    temporary.connection.client.prepare(`insert into users (id,username,display_name,role,password_hash,is_active,
+      must_change_password,failed_login_count,created_at,updated_at,row_version)
+      values ('employee-api','employee.api','موظف API','EMPLOYEE','unused',1,0,0,?,?,1)`).run(at, at);
+    const employeeToken = createSessionToken();
+    insertSession({ connection: temporary.connection, user: { id: "employee-api", username: "employee.api",
+      displayName: "موظف API", role: "EMPLOYEE", mustChangePassword: false }, token: employeeToken, now: new Date() });
+    const patched = await PATCH(request(`http://127.0.0.1:3000/api/invoices/${created.invoice.id}`, "PATCH", {
+      rowVersion: created.invoice.rowVersion, invoice: { ...body, notes: "محاولة ممنوعة" },
+    }, `oims_session=${employeeToken}`, csrfData.token, csrfData.cookie));
+    expect(patched.status).toBe(403);
+    await expect(patched.json()).resolves.toMatchObject({ error: { code: apiErrorCodes.FORBIDDEN } });
+    const stored = temporary.connection.client.prepare("select notes,row_version as rowVersion from invoices where id=?")
+      .get(created.invoice.id);
+    expect(stored).toEqual({ notes: null, rowVersion: 1n });
   });
 });
