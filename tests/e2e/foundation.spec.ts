@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 test("setup → login → settings → create and edit draft → logout", async ({ page, request }) => {
-  test.setTimeout(60_000);
+  test.setTimeout(90_000);
   await page.goto("/");
   await expect(page).toHaveURL(/\/setup$/);
   await expect(page.locator("html")).toHaveAttribute("lang", "ar");
@@ -90,10 +90,18 @@ test("setup → login → settings → create and edit draft → logout", async 
   await issueButton.click();
   await issueDialog.getByRole("button", { name: "تأكيد الإصدار" }).click();
   await expect(page.getByRole("button", { name: "جارٍ إصدار الفاتورة…" })).toBeDisabled();
-  await expect(page).toHaveURL(/\/invoices\/[0-9A-HJKMNP-TV-Z]{26}\/edit$/u);
+  await expect(page).toHaveURL(/\/invoices\/[0-9A-HJKMNP-TV-Z]{26}$/u);
+  await expect(page.locator("main[data-invoice-status]")).toHaveAttribute("data-invoice-status", "ISSUED");
   await expect(page.getByText("صادرة", { exact: true })).toBeVisible();
-  await expect(page.locator(".invoice-state-page [role='alert']")).toContainText("هذه الفاتورة صادرة");
-  const directId = /\/invoices\/([^/]+)\/edit/u.exec(new URL(page.url()).pathname)?.[1];
+  await expect(page.getByText("غير مدفوعة", { exact: true })).toBeVisible();
+  await expect(page.getByText("غير مؤرشفة", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "عينة مباشرة" })).toBeVisible();
+  await expect(page.getByText("الملخص المالي", { exact: true })).toBeVisible();
+  await expect(page.getByText("أنشأها", { exact: true })).toBeVisible();
+  await expect(page.locator(".invoice-detail-snapshot")).toContainText("الخرطوم");
+  await expect(page.locator(".invoice-detail-snapshot")).toContainText("A4");
+  await expect(page.getByRole("link", { name: /تعديل|دفع|استرداد|إلغاء|أرشفة|طباعة|PDF/u })).toHaveCount(0);
+  const directId = /\/invoices\/([^/]+)$/u.exec(new URL(page.url()).pathname)?.[1];
   const directResponse = await page.request.get(`/api/invoices/${directId}`);
   await expect(directResponse.json()).resolves.toMatchObject({ invoice: { invoiceStatus: "ISSUED", rowVersion: 1,
     totals: { grandTotalMinor: "0", remainingMinor: "0" }, printSnapshot: { capturedAt: expect.any(String) } } });
@@ -129,6 +137,12 @@ test("setup → login → settings → create and edit draft → logout", async 
   expect(firstSaved.invoice).toMatchObject({ rowVersion: 1, totals: { grandTotalMinor: "10000" } });
   expect(firstSaved.invoice.items).toHaveLength(2);
   const invoiceNumber = firstSaved.invoice.invoiceNumber;
+
+  await page.goto(`/invoices/${invoiceId}`);
+  await expect(page.locator("main[data-invoice-status]")).toHaveAttribute("data-invoice-status", "DRAFT");
+  await expect(page.getByText("مسودة", { exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "تعديل المسودة" }).click();
+  await expect(page).toHaveURL(/\/invoices\/[^/]+\/edit$/u);
 
   await page.reload();
   await expect(page.getByRole("heading", { name: "تعديل مسودة الفاتورة" })).toBeVisible();
@@ -186,20 +200,37 @@ test("setup → login → settings → create and edit draft → logout", async 
   const existingIssue = page.waitForResponse((response) => response.url().endsWith(`/api/invoices/${invoiceId}/issue`) && response.request().method() === "POST");
   await page.getByRole("button", { name: "إصدار الفاتورة" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "تأكيد الإصدار" }).click();
-  expect((await existingIssue).ok()).toBe(true);
+  const existingIssueResponse = await existingIssue;
+  expect(existingIssueResponse.status(), await existingIssueResponse.text()).toBe(200);
+  await expect(page).toHaveURL(new RegExp(`/invoices/${invoiceId}$`, "u"));
+  const issuedDetailsUrl = page.url();
   await expect(page.getByText("صادرة", { exact: true })).toBeVisible();
-  await expect(page.getByText(invoiceNumber, { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: invoiceNumber })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "شاش طبي" })).toBeVisible();
+  await expect(page.getByText("2.5", { exact: true })).toBeVisible();
+  await expect(page.getByText("200.00 ج.س", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("مدير النظام", { exact: true }).first()).toBeVisible();
   await page.reload();
-  await expect(page.locator(".invoice-state-page [role='alert']")).toContainText("هذه الفاتورة صادرة");
+  await expect(page.locator("main[data-invoice-status]")).toHaveAttribute("data-invoice-status", "ISSUED");
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await page.evaluate(() => { document.documentElement.style.zoom = "2"; });
+  await expect(page.getByText("الملخص المالي", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "شاش طبي" })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  await page.evaluate(() => { document.documentElement.style.zoom = "1"; });
+  const backFromDetails = page.getByRole("link", { name: "العودة إلى لوحة التحكم" });
+  await backFromDetails.focus();
+  await expect(backFromDetails).toBeFocused();
   const issuedResponse = await page.request.get(`/api/invoices/${invoiceId}`);
   await expect(issuedResponse.json()).resolves.toMatchObject({ invoice: { invoiceStatus: "ISSUED", rowVersion: 4,
     items: [{ quantity: "2.5" }, { quantity: "2", unitPrice: "5" }], printSnapshot: { capturedAt: expect.any(String) } } });
-  await page.getByRole("link", { name: "العودة إلى لوحة التحكم" }).click();
+  await backFromDetails.click();
 
   await page.getByRole("button", { name: "تسجيل الخروج", exact: true }).click();
   await expect(page).toHaveURL(/\/login$/);
   expect((await page.request.get("/api/auth/session")).status()).toBe(401);
-  await page.goto(editUrl);
+  await page.goto(issuedDetailsUrl);
   await expect(page).toHaveURL(/\/login$/);
   await page.goto("/setup");
   await expect(page).toHaveURL(/\/login$/);

@@ -57,6 +57,7 @@ const invoiceDtoSchema = z.object({
   createdBy: z.object({ id: z.string(), displayName: z.string() }), updatedAt: z.string(),
   updatedBy: z.object({ id: z.string(), displayName: z.string() }), issuedAt: z.string().nullable(),
   issuedBy: z.object({ id: z.string(), displayName: z.string() }).nullable(),
+  sourceInvoice: z.object({ id: z.string(), invoiceNumber: z.string() }).nullable(),
   printSnapshot: z.object({ companyNameAr: z.string(), companyNameEn: z.string(), address: z.string().nullable(),
     phones: z.array(z.string()), email: z.string().nullable(), registrationNumber: z.string().nullable(),
     footerText: z.string().nullable(), paperFormat: z.enum(["A4", "A5"]), capturedAt: z.string() }).nullable(),

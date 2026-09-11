@@ -46,7 +46,8 @@ type InvoiceRow = {
   netCollectedMinor: bigint; remainingMinor: bigint; notes: string | null; paymentTerms: string | null;
   createdAt: string; createdBy: string; createdByName: string; updatedAt: string;
   updatedBy: string; updatedByName: string; issuedAt: string | null;
-  issuedBy: string | null; issuedByName: string | null; rowVersion: bigint;
+  issuedBy: string | null; issuedByName: string | null; copiedFromInvoiceId: string | null;
+  sourceInvoiceNumber: string | null; rowVersion: bigint;
 };
 
 type ItemRow = {
@@ -290,9 +291,13 @@ function readInvoiceRow(connection: DatabaseConnection, id: string): InvoiceRow 
     i.net_collected_minor as netCollectedMinor,i.remaining_minor as remainingMinor,i.notes,i.payment_terms as paymentTerms,
     i.created_at as createdAt,i.created_by as createdBy,cu.display_name as createdByName,
     i.updated_at as updatedAt,i.updated_by as updatedBy,uu.display_name as updatedByName,
-    i.issued_at as issuedAt,i.issued_by as issuedBy,iu.display_name as issuedByName,i.row_version as rowVersion
+    i.issued_at as issuedAt,i.issued_by as issuedBy,iu.display_name as issuedByName,
+    i.copied_from_invoice_id as copiedFromInvoiceId,source.invoice_number as sourceInvoiceNumber,
+    i.row_version as rowVersion
     from invoices i join users cu on cu.id=i.created_by join users uu on uu.id=i.updated_by
-    left join users iu on iu.id=i.issued_by where i.id=?`).get(id) as InvoiceRow | undefined;
+    left join users iu on iu.id=i.issued_by
+    left join invoices source on source.id=i.copied_from_invoice_id
+    where i.id=?`).get(id) as InvoiceRow | undefined;
 }
 
 function toDto(connection: DatabaseConnection, row: InvoiceRow): InvoiceDraftDto {
@@ -322,6 +327,9 @@ function toDto(connection: DatabaseConnection, row: InvoiceRow): InvoiceDraftDto
     updatedAt: row.updatedAt, updatedBy: { id: row.updatedBy, displayName: row.updatedByName },
     issuedAt: row.issuedAt,
     issuedBy: row.issuedBy && row.issuedByName ? { id: row.issuedBy, displayName: row.issuedByName } : null,
+    sourceInvoice: row.copiedFromInvoiceId && row.sourceInvoiceNumber
+      ? { id: row.copiedFromInvoiceId, invoiceNumber: row.sourceInvoiceNumber }
+      : null,
     printSnapshot: readPrintSnapshot(connection, row.id),
     rowVersion: Number(row.rowVersion),
   };

@@ -82,6 +82,7 @@ export type InvoiceDraftDto = {
   createdAt: string; createdBy: { id: string; displayName: string };
   updatedAt: string; updatedBy: { id: string; displayName: string };
   issuedAt: string | null; issuedBy: { id: string; displayName: string } | null;
+  sourceInvoice: { id: string; invoiceNumber: string } | null;
   printSnapshot: PrintSnapshotDto | null;
   rowVersion: number;
 };

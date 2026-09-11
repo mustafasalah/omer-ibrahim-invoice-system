@@ -217,8 +217,8 @@ export function InvoiceEditor({
       setWarnings((body.warnings ?? []).filter((warning) => warning.code === "FUTURE_INVOICE_DATE").map(() => messages.futureDateWarning));
       setStatus("issued");
       setStatusMessage(messages.issued.replace("{number}", issued.invoiceNumber));
-      const editPath = `/invoices/${encodeURIComponent(issued.id)}/edit`;
-      window.setTimeout(() => { router.replace(editPath); router.refresh(); }, 0);
+      const detailsPath = `/invoices/${encodeURIComponent(issued.id)}`;
+      window.setTimeout(() => router.replace(detailsPath), 0);
     } catch {
       setStatus("unavailable");
       setStatusMessage(messages.issueUnknownOutcome);
