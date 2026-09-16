@@ -58,15 +58,15 @@ function characterLength(value: string): number {
 }
 
 function lowerLatin(value: string): string {
-  return value.replace(/[A-Z]/g, (character) => character.toLowerCase());
+  return value.replace(/\p{Script=Latin}/gu, (character) => character.toLowerCase());
 }
 
 export function normalizeUsername(value: string): string {
-  return lowerLatin(value.normalize("NFKC").trim());
+  return lowerLatin(value.normalize("NFKC").trim()).normalize("NFKC");
 }
 
 function normalizePasswordComparison(value: string): string {
-  return lowerLatin(value.normalize("NFKC").trim());
+  return lowerLatin(value.normalize("NFKC").trim()).normalize("NFKC");
 }
 
 export function validateBootstrapAdminInput(

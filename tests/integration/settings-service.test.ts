@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { getSettings, updateSettings } from "@/server/settings/service";
+import { createInvoiceDraft } from "@/server/invoices/service";
 import { apiErrorCodes } from "@/server/http/errors";
 import { createTestAdmin } from "../fixtures/auth";
 import { createTemporaryDatabase, type TemporaryDatabase } from "../fixtures/database";
@@ -60,6 +61,27 @@ describe("settings persistence", () => {
       actor: { id: admin.id, displayName: admin.displayName }, requestId: "audit-fail",
       auditAppender: () => { throw new Error("simulated audit failure"); } })).toThrow();
     expect(getSettings({ connection: temporary.connection }).settings.currency.code).toBe(current.settings.currency.code);
+  });
+
+  it("keeps old invoice numbers and applies a changed prefix and pattern only to new invoices (AT-NUM-005)", async () => {
+    temporary = createTemporaryDatabase(); const admin = await createTestAdmin(temporary.connection);
+    const connection = temporary.connection; const at = new Date("2026-08-27T08:00:00Z");
+    const actor = { id: admin.id, displayName: admin.displayName, role: admin.role };
+    const oldInvoice = createInvoiceDraft({ connection, actor, input: { intent: "SAVE_DRAFT", invoice: {} },
+      requestId: "old-format", now: at });
+    const current = getSettings({ connection, now: at }).settings;
+    const { input } = changedSettings({ numbering: {
+      ...current.numbering, prefix: "NEW", pattern: "{PREFIX}/{YY}/{SEQ:3}",
+    } });
+    const changed = updateSettings({ connection, input,
+      actor: { id: admin.id, displayName: admin.displayName }, requestId: "change-number-format", now: at });
+    expect(changed.preview.invoiceNumber).toBe("NEW/26/002");
+    const newInvoice = createInvoiceDraft({ connection, actor, input: { intent: "SAVE_DRAFT", invoice: {} },
+      requestId: "new-format", now: at });
+    expect(oldInvoice.invoice.invoiceNumber).toBe("OI-2026-00001");
+    expect(newInvoice.invoice.invoiceNumber).toBe("NEW/26/002");
+    expect(connection.client.prepare("select invoice_number as invoiceNumber from invoices order by invoice_number").all())
+      .toEqual([{ invoiceNumber: "NEW/26/002" }, { invoiceNumber: "OI-2026-00001" }]);
   });
 
   it("covers AT-NUM-006 and preserves currency snapshots in existing invoices", async () => {

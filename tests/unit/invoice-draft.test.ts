@@ -12,12 +12,28 @@ describe("invoice draft contracts", () => {
           quantity: null, unitPrice: null, updateSuggestion: false, reactivateSuggestion: false }], notes: null } });
   });
 
-  it("rejects issue intents, server-owned fields, unknown nested fields, and supplied sort order", () => {
+  it("ignores known calculated fields instead of trusting them", () => {
+    const parsed = parseCreateDraft({ intent: "SAVE_DRAFT", invoice: {
+      totals: { grandTotalMinor: "999999" },
+      subtotalMinor: "999999",
+      grandTotalMinor: "999999",
+      items: [{ productName: "x", quantity: "2", unitPrice: "5",
+        baseMinor: "1", lineTotalMinor: "1", taxMinor: "1" }],
+    } });
+    expect(parsed.invoice).toEqual({ dueDate: null, beneficiary: null,
+      items: [{ productName: "x", description: null, unit: null, quantity: "2", unitPrice: "5",
+        updateSuggestion: false, reactivateSuggestion: false }], notes: null });
+  });
+
+  it("rejects issue intents, lifecycle fields, unknown nested fields, and supplied sort order", () => {
     for (const input of [
       { intent: "ISSUE", invoice: {} },
-      { intent: "SAVE_DRAFT", invoice: { totals: { grandTotalMinor: "1" } } },
       { intent: "SAVE_DRAFT", invoice: { invoiceNumber: "fake" } },
+      { intent: "SAVE_DRAFT", invoice: { invoiceStatus: "ISSUED" } },
+      { intent: "SAVE_DRAFT", invoice: { rowVersion: 7 } },
+      { intent: "SAVE_DRAFT", invoice: { unknownField: true } },
       { intent: "SAVE_DRAFT", invoice: { items: [{ sortOrder: 99 }] } },
+      { intent: "SAVE_DRAFT", invoice: { items: [{ unknownField: true }] } },
     ]) expect(() => parseCreateDraft(input)).toThrow(DraftValidationError);
   });
 

@@ -101,6 +101,31 @@ export class DraftValidationError extends Error {
 
 const optionalText = (maximum: number) => z.string().max(maximum).nullable().optional();
 const suggestionId = z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/u);
+const ignoredCalculatedValue = z.unknown().optional();
+
+const calculatedInvoiceFields = {
+  totals: ignoredCalculatedValue,
+  subtotalMinor: ignoredCalculatedValue,
+  lineDiscountsMinor: ignoredCalculatedValue,
+  invoiceDiscountMinor: ignoredCalculatedValue,
+  discountTotalMinor: ignoredCalculatedValue,
+  taxableTotalMinor: ignoredCalculatedValue,
+  taxTotalMinor: ignoredCalculatedValue,
+  grandTotalMinor: ignoredCalculatedValue,
+  grossPaidMinor: ignoredCalculatedValue,
+  refundedTotalMinor: ignoredCalculatedValue,
+  netCollectedMinor: ignoredCalculatedValue,
+  remainingMinor: ignoredCalculatedValue,
+};
+
+const calculatedItemFields = {
+  baseMinor: ignoredCalculatedValue,
+  discountMinor: ignoredCalculatedValue,
+  allocatedInvoiceDiscountMinor: ignoredCalculatedValue,
+  taxableMinor: ignoredCalculatedValue,
+  taxMinor: ignoredCalculatedValue,
+  lineTotalMinor: ignoredCalculatedValue,
+};
 
 const beneficiarySchema = z.object({
   suggestionId: suggestionId.optional(),
@@ -122,6 +147,7 @@ const itemSchema = z.object({
   unitPrice: z.string().max(100).nullable().optional(),
   updateSuggestion: z.boolean().optional(),
   reactivateSuggestion: z.boolean().optional(),
+  ...calculatedItemFields,
 }).strict();
 
 const invoiceSchema = z.object({
@@ -131,6 +157,7 @@ const invoiceSchema = z.object({
   items: z.array(itemSchema).max(MAX_DRAFT_ITEMS).optional(),
   notes: optionalText(2_000),
   paymentTerms: optionalText(2_000),
+  ...calculatedInvoiceFields,
 }).strict();
 
 const createSchema = z.object({ intent: z.literal("SAVE_DRAFT"), invoice: invoiceSchema }).strict();

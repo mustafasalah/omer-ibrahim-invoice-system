@@ -185,13 +185,19 @@ describe("atomic invoice issue and historical print snapshot", () => {
     for (const point of ["afterSequence", "afterSuggestions", "afterInvoice", "afterItems", "afterSnapshot",
       "afterStatus", "afterAudit"] satisfies InvoiceFaultPoint[]) {
       const { connection, actor } = await setup();
+      connection.client.prepare("insert into invoice_sequences (sequence_key,last_value,updated_at) values (?,?,?)")
+        .run("invoice:2026", 40, now.toISOString());
       const beforeAudit = count(connection, "audit_logs");
       expect(() => createIssuedInvoice({ connection, actor, requestId: `fault-${point}`, now, input: direct(),
         faultInjector: (current) => { if (current === point) throw new Error(`fault:${point}`); } }))
         .toThrow();
-      for (const table of ["invoice_sequences", "beneficiaries", "products", "invoices", "invoice_items",
+      for (const table of ["beneficiaries", "products", "invoices", "invoice_items",
         "invoice_print_snapshots"]) expect(count(connection, table), `${point}:${table}`).toBe(0n);
       expect(count(connection, "audit_logs"), `${point}:audit_logs`).toBe(beforeAudit);
+      expect(connection.client.prepare("select last_value as lastValue from invoice_sequences where sequence_key=?")
+        .get("invoice:2026")).toEqual({ lastValue: 40n });
+      const recovered = createIssuedInvoice({ connection, actor, requestId: `recovered-${point}`, now, input: direct() });
+      expect(recovered.invoice).toMatchObject({ invoiceNumber: "OI-2026-00041", invoiceStatus: "ISSUED" });
       expect(connection.client.pragma("quick_check", { simple: true })).toBe("ok");
       temporary?.dispose(); temporary = undefined;
     }

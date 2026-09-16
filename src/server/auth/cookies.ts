@@ -35,6 +35,19 @@ export function readCookie(request: Request, name: string): string | undefined {
   return undefined;
 }
 
+export function hasCookie(request: Request, name: string): boolean {
+  const cookieHeader = request.headers.get("cookie");
+
+  if (!cookieHeader) {
+    return false;
+  }
+
+  return cookieHeader.split(";").some((part) => {
+    const separator = part.indexOf("=");
+    return separator >= 0 && part.slice(0, separator).trim() === name;
+  });
+}
+
 export function setSessionCookie(
   response: NextResponse,
   request: Request,

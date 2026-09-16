@@ -31,7 +31,7 @@ function request(url: string, method: "POST" | "PATCH", body: unknown, authCooki
 }
 
 describe("invoice draft API", () => {
-  it("enforces authentication, CSRF, strict server-owned fields, and the save-draft intent", async () => {
+  it("enforces authentication, CSRF, lifecycle-field ownership, and the save-draft intent", async () => {
     temporary = createTemporaryDatabase(); globalThis.__oimsDatabaseConnection = temporary.connection;
     const unauthenticated = await POST(new Request("http://127.0.0.1:3000/api/invoices", { method: "POST",
       headers: { "content-type": "application/json" }, body: "{}" }));
@@ -44,14 +44,42 @@ describe("invoice draft API", () => {
     expect(missingCsrf.status).toBe(403);
     const csrfData = await csrf();
     for (const body of [{ intent: "ISSUE", invoice: {} },
-      { intent: "SAVE_DRAFT", invoice: { grandTotalMinor: "999" } },
-      { intent: "SAVE_DRAFT", invoice: { invoiceStatus: "ISSUED" } }]) {
+      { intent: "SAVE_DRAFT", invoice: { invoiceNumber: "forged" } },
+      { intent: "SAVE_DRAFT", invoice: { invoiceStatus: "ISSUED" } },
+      { intent: "SAVE_DRAFT", invoice: { rowVersion: 99 } },
+      { intent: "SAVE_DRAFT", invoice: { unknownField: true } },
+      { intent: "SAVE_DRAFT", invoice: { items: [{ sortOrder: 99 }] } }]) {
       const response = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", body, authCookie, csrfData.token, csrfData.cookie));
       expect(response.status).toBe(422);
       expect(await response.json()).toMatchObject({ error: { code: apiErrorCodes.VALIDATION_ERROR,
         requestId: "invoice-api-test" } });
     }
     expect((temporary.connection.client.prepare("select count(*) as count from invoice_sequences").get() as { count: bigint }).count).toBe(0n);
+  });
+
+  it("ignores forged calculated fields and persists server-recalculated values (AT-CALC-010)", async () => {
+    temporary = createTemporaryDatabase(); globalThis.__oimsDatabaseConnection = temporary.connection;
+    const admin = await createTestAdmin(temporary.connection); const token = createSessionToken();
+    insertSession({ connection: temporary.connection, user: admin, token, now: new Date() });
+    const csrfData = await csrf();
+    const response = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+      intent: "SAVE_DRAFT",
+      invoice: {
+        totals: { subtotalMinor: "1", grandTotalMinor: "1", remainingMinor: "1" },
+        subtotalMinor: "2",
+        grandTotalMinor: "2",
+        items: [{ productName: "server calculation", quantity: "2", unitPrice: "5",
+          baseMinor: "3", taxableMinor: "3", lineTotalMinor: "3" }],
+      },
+    }, `oims_session=${token}`, csrfData.token, csrfData.cookie));
+    expect(response.status).toBe(201);
+    const body = await response.json() as { invoice: { id: string; totals: Record<string, string>;
+      items: Array<{ baseMinor: string; taxableMinor: string; lineTotalMinor: string }> } };
+    expect(body.invoice.totals).toMatchObject({ subtotalMinor: "1000", grandTotalMinor: "1000", remainingMinor: "1000" });
+    expect(body.invoice.items[0]).toMatchObject({ baseMinor: "1000", taxableMinor: "1000", lineTotalMinor: "1000" });
+    expect(temporary.connection.client.prepare(`select subtotal_minor as subtotalMinor,
+      grand_total_minor as grandTotalMinor,remaining_minor as remainingMinor from invoices where id=?`)
+      .get(body.invoice.id)).toEqual({ subtotalMinor: 1000n, grandTotalMinor: 1000n, remainingMinor: 1000n });
   });
 
   it("creates, reads, and patches a draft without exposing persistence internals", async () => {
@@ -115,7 +143,7 @@ describe("invoice draft API", () => {
     const invoice = { invoiceDate: "2026-08-27", beneficiary: { name: "عميل API" },
       items: [{ productName: "منتج API", quantity: "2", unitPrice: "3" }] };
     const forged = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
-      intent: "ISSUE", invoice: { ...invoice, grandTotalMinor: "1" },
+      intent: "ISSUE", invoice: { ...invoice, invoiceStatus: "ISSUED" },
     }, authCookie, csrfData.token, csrfData.cookie));
     expect(forged.status).toBe(422);
     expect((temporary.connection.client.prepare("select count(*) as count from invoices").get() as { count: bigint }).count).toBe(0n);

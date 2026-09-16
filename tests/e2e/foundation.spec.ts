@@ -1,4 +1,35 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+
+const externalRequestsByPage = new WeakMap<Page, string[]>();
+
+function isAllowedOfflineUrl(value: string): boolean {
+  if (value.startsWith("data:") || value.startsWith("blob:")) return true;
+
+  try {
+    const { hostname } = new URL(value);
+    return hostname === "localhost"
+      || hostname === "::1"
+      || hostname === "[::1]"
+      || /^127(?:\.\d{1,3}){3}$/u.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
+test.beforeEach(({ page }) => {
+  const externalRequests: string[] = [];
+  externalRequestsByPage.set(page, externalRequests);
+  page.on("request", (browserRequest) => {
+    if (!isAllowedOfflineUrl(browserRequest.url())) externalRequests.push(browserRequest.url());
+  });
+});
+
+test.afterEach(({ page }) => {
+  expect(
+    externalRequestsByPage.get(page) ?? [],
+    "The browser must not request non-loopback network resources during local operation.",
+  ).toEqual([]);
+});
 
 test("setup → login → settings → create and edit draft → logout", async ({ page, request }) => {
   test.setTimeout(90_000);
@@ -52,7 +83,7 @@ test("setup → login → settings → create and edit draft → logout", async 
   await expect(page.getByLabel("العنوان")).toHaveValue("الخرطوم");
   await page.getByRole("link", { name: "العودة إلى لوحة التحكم" }).click();
 
-  await page.getByRole("link", { name: "إنشاء فاتورة جديدة" }).click();
+  await page.keyboard.press("Alt+n");
   await expect(page).toHaveURL(/\/invoices\/new$/);
   await expect(page.getByRole("heading", { name: "فاتورة جديدة" })).toBeVisible();
   await expect(page.getByText("لم تُحفظ بعد", { exact: true })).toBeVisible();
@@ -60,24 +91,36 @@ test("setup → login → settings → create and edit draft → logout", async 
 
   const issueButton = page.getByRole("button", { name: "إصدار الفاتورة" });
   await expect(issueButton).toBeEnabled();
-  await issueButton.click();
+  await issueButton.focus();
+  await page.keyboard.press("Enter");
   const issueDialog = page.getByRole("dialog", { name: "تأكيد إصدار الفاتورة" });
   await expect(issueDialog).toContainText("ستصبح الفاتورة رسمية");
   await expect(issueDialog.getByRole("button", { name: "العودة إلى المحرر" })).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(issueDialog).toBeHidden();
   await expect(issueButton).toBeFocused();
-  await issueButton.click();
-  await issueDialog.getByRole("button", { name: "تأكيد الإصدار" }).click();
+  await page.keyboard.press("Enter");
+  const confirmIssueButton = issueDialog.getByRole("button", { name: "تأكيد الإصدار" });
+  await page.keyboard.press("Tab");
+  await expect(confirmIssueButton).toBeFocused();
+  await page.keyboard.press("Enter");
   const issueErrors = page.locator(".invoice-error-summary");
   await expect(issueErrors).toBeFocused();
   await expect(issueErrors).toContainText("تعذر إصدار الفاتورة");
   await expect(page).toHaveURL(/\/invoices\/new$/);
   await expect(page.getByText("لم تُحفظ بعد", { exact: true })).toBeVisible();
-  await issueErrors.getByRole("button").first().click();
+  const firstIssueError = issueErrors.getByRole("button").first();
+  await page.keyboard.press("Tab");
+  await expect(firstIssueError).toBeFocused();
+  await page.keyboard.press("Enter");
   await expect(page.getByLabel("اسم المستفيد")).toBeFocused();
 
-  await page.getByLabel("اسم المستفيد").fill("مستشفى الإصدار المباشر");
+  const directBeneficiaryName = page.getByLabel("اسم المستفيد");
+  await directBeneficiaryName.focus();
+  await page.keyboard.press("Alt+n");
+  await expect(page).toHaveURL(/\/invoices\/new$/);
+  await expect(directBeneficiaryName).toBeFocused();
+  await directBeneficiaryName.fill("مستشفى الإصدار المباشر");
   await page.getByLabel("اسم المنتج").fill("عينة مباشرة");
   await page.getByLabel("الكمية").fill("1");
   await page.getByLabel("سعر الوحدة").fill("0");
@@ -87,8 +130,11 @@ test("setup → login → settings → create and edit draft → logout", async 
     }
     await route.continue();
   }, { times: 1 });
-  await issueButton.click();
-  await issueDialog.getByRole("button", { name: "تأكيد الإصدار" }).click();
+  await issueButton.focus();
+  await page.keyboard.press("Enter");
+  await page.keyboard.press("Tab");
+  await expect(confirmIssueButton).toBeFocused();
+  await page.keyboard.press("Enter");
   await expect(page.getByRole("button", { name: "جارٍ إصدار الفاتورة…" })).toBeDisabled();
   await expect(page).toHaveURL(/\/invoices\/[0-9A-HJKMNP-TV-Z]{26}$/u);
   await expect(page.locator("main[data-invoice-status]")).toHaveAttribute("data-invoice-status", "ISSUED");

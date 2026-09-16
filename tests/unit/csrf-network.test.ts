@@ -55,4 +55,39 @@ describe("CSRF and bootstrap network protection", () => {
     ).toBe(false);
     expect(isLoopbackBootstrapRequest(protectedRequest("unused"), "0.0.0.0")).toBe(false);
   });
+
+  it("requires strictly parsed loopback URL and Host values to prevent DNS rebinding", () => {
+    expect(
+      isLoopbackBootstrapRequest(
+        new Request("http://attacker.test/api/bootstrap/admin", {
+          headers: { host: "127.0.0.1:3000" },
+        }),
+        "127.0.0.1",
+      ),
+    ).toBe(false);
+    expect(
+      isLoopbackBootstrapRequest(
+        new Request("http://127.0.0.1:3000/api/bootstrap/admin", {
+          headers: { host: "attacker.test" },
+        }),
+        "127.0.0.1",
+      ),
+    ).toBe(false);
+    expect(
+      isLoopbackBootstrapRequest(
+        new Request("http://127.0.0.1:3000/api/bootstrap/admin", {
+          headers: { host: "127.0.0.1:3000,attacker.test" },
+        }),
+        "127.0.0.1",
+      ),
+    ).toBe(false);
+    expect(
+      isLoopbackBootstrapRequest(
+        new Request("http://[::1]:3000/api/bootstrap/admin", {
+          headers: { host: "[::1]:3000" },
+        }),
+        "::1",
+      ),
+    ).toBe(true);
+  });
 });

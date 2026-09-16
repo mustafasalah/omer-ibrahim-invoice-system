@@ -1,7 +1,11 @@
 import "server-only";
 
 import { NextResponse } from "next/server";
-import { deleteSessionCookie } from "@/server/auth/cookies";
+import {
+  deleteSessionCookie,
+  hasCookie,
+  SESSION_COOKIE_NAME,
+} from "@/server/auth/cookies";
 import { getLogger } from "@/server/logging/logger";
 import { toApiError } from "./errors";
 import { getRequestId } from "./request-id";
@@ -36,7 +40,7 @@ export function withApiHandler(handler: ApiHandler): (request: Request) => Promi
         // Logging must never replace the stable, redacted API error response.
       }
       const response = NextResponse.json(body, { status, headers });
-      if (status === 401) {
+      if (status === 401 && hasCookie(request, SESSION_COOKIE_NAME)) {
         deleteSessionCookie(response, request);
       }
       return withRequestId(response, requestId);

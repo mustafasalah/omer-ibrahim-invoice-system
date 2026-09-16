@@ -117,6 +117,20 @@ describe("bootstrap and authentication API", () => {
       error: { code: apiErrorCodes.BOOTSTRAP_LOCAL_ONLY },
     });
 
+    const rebindingCsrf = await csrf("http://attacker.test");
+    const rebinding = await bootstrapAdminRoute(
+      mutationRequest({
+        url: "http://attacker.test/api/bootstrap/admin",
+        csrfToken: rebindingCsrf.token,
+        csrfCookie: rebindingCsrf.cookie,
+        body: {},
+      }),
+    );
+    expect(rebinding.status).toBe(403);
+    await expect(rebinding.json()).resolves.toMatchObject({
+      error: { code: apiErrorCodes.BOOTSTRAP_LOCAL_ONLY },
+    });
+
     const created = await bootstrapThroughApi();
     const serializedCreated = JSON.stringify(await created.json());
     expect(created.status).toBe(201);
@@ -146,9 +160,18 @@ describe("bootstrap and authentication API", () => {
       new Request("http://127.0.0.1:3000/api/auth/session"),
     );
     expect(unauthenticated.status).toBe(401);
+    expect(unauthenticated.headers.get("set-cookie")).toBeNull();
     await expect(unauthenticated.json()).resolves.toMatchObject({
       error: { code: apiErrorCodes.UNAUTHORIZED },
     });
+
+    const invalidSession = await sessionRoute(
+      new Request("http://127.0.0.1:3000/api/auth/session", {
+        headers: { cookie: "oims_session=invalid-or-expired-token" },
+      }),
+    );
+    expect(invalidSession.status).toBe(401);
+    expect(invalidSession.headers.get("set-cookie")).toMatch(/oims_session=;.*Max-Age=0/i);
 
     const csrfData = await csrf("https://127.0.0.1:3000");
     const loginResponse = await loginRoute(

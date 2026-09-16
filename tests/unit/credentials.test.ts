@@ -21,6 +21,8 @@ function validInput(overrides: Record<string, string> = {}) {
 describe("authentication credentials", () => {
   it("normalizes usernames and folds Latin casing", () => {
     expect(normalizeUsername("  ＡdMin.Local  ")).toBe("admin.local");
+    expect(normalizeUsername("  ÉQUIPE.Admin  ")).toBe("équipe.admin");
+    expect(normalizeUsername("équipe.admin")).toBe(normalizeUsername("ÉQUIPE.ADMIN"));
   });
 
   it("preserves password spaces exactly", () => {
@@ -53,6 +55,14 @@ describe("authentication credentials", () => {
       }),
       messages,
     );
+    const unicodeLatinMatching = validateBootstrapAdminInput(
+      validInput({
+        username: "ÉclairAdmin",
+        password: "éclairadmin",
+        passwordConfirmation: "éclairadmin",
+      }),
+      messages,
+    );
     const mismatch = validateBootstrapAdminInput(
       validInput({ passwordConfirmation: "different password" }),
       messages,
@@ -66,6 +76,10 @@ describe("authentication credentials", () => {
     expect(short).toMatchObject({ success: false, fieldErrors: { password: expect.any(String) } });
     expect(common).toMatchObject({ success: false, fieldErrors: { password: expect.any(String) } });
     expect(matching).toMatchObject({ success: false, fieldErrors: { password: expect.any(String) } });
+    expect(unicodeLatinMatching).toMatchObject({
+      success: false,
+      fieldErrors: { password: expect.any(String) },
+    });
     expect(mismatch).toMatchObject({
       success: false,
       fieldErrors: { passwordConfirmation: expect.any(String) },

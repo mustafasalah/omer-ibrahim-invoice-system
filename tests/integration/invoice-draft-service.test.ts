@@ -52,13 +52,13 @@ describe("atomic invoice draft persistence", () => {
     expect(free.invoice.totals.grandTotalMinor).toBe("0");
   });
 
-  it("snapshots currency and defaults once, while a patch keeps the original currency and number", async () => {
+  it("preserves two-decimal invoices after settings change and gives new invoices zero decimals (AT-CALC-011)", async () => {
     const { connection, actor } = await setup();
     getSettings({ connection, now });
     connection.client.prepare("update app_settings set default_payment_terms='نقداً' where id='default'").run();
     const created = createInvoiceDraft({ connection, actor, input: draft(), requestId: "snapshot", now });
     expect(created.invoice.paymentTerms).toBe("نقداً");
-    connection.client.prepare("update app_settings set currency_code='USD',currency_symbol_ar='$',currency_decimals=3 where id='default'").run();
+    connection.client.prepare("update app_settings set currency_code='USD',currency_symbol_ar='$',currency_decimals=0 where id='default'").run();
     const updated = updateInvoiceDraft({ connection, actor, id: created.invoice.id, requestId: "patch", now,
       input: { rowVersion: 1, invoice: { invoiceDate: "2026-08-27", beneficiary: null,
         items: [{ productName: "قفازات", quantity: "1", unitPrice: "1.234" }] } } });
@@ -66,6 +66,15 @@ describe("atomic invoice draft persistence", () => {
     expect(updated.invoice.invoiceNumber).toBe(created.invoice.invoiceNumber);
     expect(updated.invoice.createdBy.id).toBe(created.invoice.createdBy.id);
     expect(updated.invoice.totals.grandTotalMinor).toBe("123");
+    const newer = createInvoiceDraft({ connection, actor, input: draft({
+      items: [{ productName: "new precision", quantity: "1", unitPrice: "1.5" }],
+    }), requestId: "new-currency-precision", now });
+    expect(getInvoiceDraft(created.invoice.id, { connection })).toMatchObject({
+      currency: { code: "SDG", decimals: 2 }, totals: { grandTotalMinor: "123" },
+    });
+    expect(newer.invoice).toMatchObject({
+      currency: { code: "USD", symbol: "$", decimals: 0 }, totals: { grandTotalMinor: "2" },
+    });
   });
 
   it("enforces date rules by role and returns an admin warning", async () => {
@@ -152,6 +161,8 @@ describe("atomic invoice draft persistence", () => {
   it.each<InvoiceFaultPoint>(["afterSequence", "afterSuggestions", "afterInvoice", "afterItems", "afterAudit"])(
     "rolls back every artifact for injected failure at %s", async (point) => {
       const { connection, actor } = await setup();
+      connection.client.prepare("insert into invoice_sequences (sequence_key,last_value,updated_at) values (?,?,?)")
+        .run("invoice:2026", 40, now.toISOString());
       const baselines = new Map<string, bigint>();
       for (const table of ["invoice_sequences", "beneficiaries", "products", "invoices", "invoice_items", "audit_logs"]) {
         baselines.set(table, (connection.client.prepare(`select count(*) as count from ${table}`).get() as { count: bigint }).count);
@@ -162,6 +173,11 @@ describe("atomic invoice draft persistence", () => {
         const result = connection.client.prepare(`select count(*) as count from ${table}`).get() as { count: bigint };
         expect(result.count, table).toBe(baselines.get(table));
       }
+      expect(connection.client.prepare("select last_value as lastValue from invoice_sequences where sequence_key=?")
+        .get("invoice:2026")).toEqual({ lastValue: 40n });
+      const recovered = createInvoiceDraft({ connection, actor, input: draft(),
+        requestId: `recovered-${point}`, now });
+      expect(recovered.invoice.invoiceNumber).toBe("OI-2026-00041");
       expect(connection.client.pragma("quick_check", { simple: true })).toBe("ok");
     });
 

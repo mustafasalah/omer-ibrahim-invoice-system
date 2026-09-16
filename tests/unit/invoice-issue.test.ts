@@ -18,7 +18,7 @@ describe("invoice issue request validation", () => {
     }));
   });
 
-  it("rejects malformed, zero, negative, over-scale, and server-owned values", () => {
+  it("rejects malformed, zero, negative, and over-scale values", () => {
     for (const [field, value, code] of [
       ["quantity", "0", "QUANTITY_MUST_BE_POSITIVE"],
       ["quantity", "-1", "QUANTITY_MUST_BE_POSITIVE"],
@@ -31,10 +31,23 @@ describe("invoice issue request validation", () => {
         beneficiary: { name: "customer" }, items: [item],
       } })).toThrowError(expect.objectContaining({ fieldErrors: expect.objectContaining({ [`items.0.${field}`]: code }) }));
     }
-    expect(() => parseCreateIssue({ intent: "ISSUE", invoice: {
+  });
+
+  it("ignores calculated values but rejects lifecycle and unknown fields", () => {
+    const parsed = parseCreateIssue({ intent: "ISSUE", invoice: {
       beneficiary: { name: "customer" }, items: [{ productName: "x", quantity: "1", unitPrice: "1" }],
       grandTotalMinor: "1",
-    } })).toThrowError(expect.objectContaining({ fieldErrors: expect.objectContaining({ invoice: expect.any(String) }) }));
+      totals: { grandTotalMinor: "1" },
+    } });
+    expect(parsed.invoice).not.toHaveProperty("grandTotalMinor");
+    expect(parsed.invoice).not.toHaveProperty("totals");
+    for (const field of ["invoiceNumber", "invoiceStatus", "rowVersion", "unknownField"] as const) {
+      expect(() => parseCreateIssue({ intent: "ISSUE", invoice: {
+        beneficiary: { name: "customer" },
+        items: [{ productName: "x", quantity: "1", unitPrice: "1" }],
+        [field]: field === "rowVersion" ? 1 : "forged",
+      } })).toThrowError(expect.objectContaining({ fieldErrors: expect.any(Object) }));
+    }
   });
 
   it("requires a positive row version for an existing draft issue", () => {

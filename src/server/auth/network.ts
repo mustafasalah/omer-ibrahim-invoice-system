@@ -52,8 +52,62 @@ function forwardedAddress(request: Request): string | undefined {
   return request.headers.get("x-real-ip") ?? undefined;
 }
 
+function hasValidPort(value: string | undefined): boolean {
+  if (value === undefined) {
+    return true;
+  }
+
+  const port = Number(value);
+  return /^\d{1,5}$/.test(value) && port >= 1 && port <= 65_535;
+}
+
+function parseHostHeader(value: string | null): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const host = value.trim();
+
+  if (!host || /[\s,/@\\?#]/u.test(host)) {
+    return undefined;
+  }
+
+  if (host.startsWith("[")) {
+    const match = /^\[([0-9a-f:.]+)\](?::(\d{1,5}))?$/iu.exec(host);
+    return match && hasValidPort(match[2]) ? match[1] : undefined;
+  }
+
+  const match = /^([a-z0-9.-]+)(?::(\d{1,5}))?$/iu.exec(host);
+  return match && hasValidPort(match[2]) ? match[1] : undefined;
+}
+
 export function isLoopbackBootstrapRequest(request: Request, boundHost: string): boolean {
   if (!isLoopbackAddress(boundHost)) {
+    return false;
+  }
+
+  let requestHostname: string;
+
+  try {
+    const requestUrl = new URL(request.url);
+    if (
+      (requestUrl.protocol !== "http:" && requestUrl.protocol !== "https:") ||
+      requestUrl.username ||
+      requestUrl.password
+    ) {
+      return false;
+    }
+    requestHostname = requestUrl.hostname;
+  } catch {
+    return false;
+  }
+
+  const headerHostname = parseHostHeader(request.headers.get("host"));
+  if (
+    !headerHostname ||
+    !isLoopbackAddress(headerHostname) ||
+    !isLoopbackAddress(requestHostname)
+  ) {
     return false;
   }
 
