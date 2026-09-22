@@ -88,6 +88,8 @@ describe("invoice draft API", () => {
     expect((temporary.connection.client.prepare("select count(*) as count from invoice_sequences").get() as { count: bigint }).count).toBe(0n);
     expect((temporary.connection.client.prepare("select count(*) as count from audit_logs where event_type='INVOICE_CREATED'")
       .get() as { count: bigint }).count).toBe(0n);
+    expect((temporary.connection.client.prepare("select count(*) as count from invoice_idempotency_records")
+      .get() as { count: bigint }).count).toBe(0n);
 
     const valid = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
       intent: "SAVE_DRAFT", invoice: { items: [] },
@@ -130,18 +132,30 @@ describe("invoice draft API", () => {
       intent: "ISSUE", invoice: {},
     }, "", csrfData.token, csrfData.cookie));
     expect(unauthenticated.status).toBe(401);
-    const createdResponse = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+    const createBody = {
       intent: "SAVE_DRAFT", invoice: { beneficiary: { name: "عميل" },
         items: [{ clientKey: "one", productName: "منتج", quantity: "2", unitPrice: "5" }] },
-    }, authCookie, csrfData.token, csrfData.cookie));
+    };
+    const createdResponse = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", createBody,
+      authCookie, csrfData.token, csrfData.cookie));
     expect(createdResponse.status).toBe(201);
     const created = await createdResponse.json() as DraftResult & { requestId: string };
     expect(created.requestId).toBe("invoice-api-test");
-    const lostResponseRetry = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
-      intent: "SAVE_DRAFT", invoice: { notes: "a retry must return the committed operation", items: [] },
-    }, authCookie, csrfData.token, csrfData.cookie, "invoice-api-retry", "invoice-api-test-key"));
+    const lostResponseRetry = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", createBody,
+      authCookie, csrfData.token, csrfData.cookie, "invoice-api-retry", "invoice-api-test-key"));
     expect(lostResponseRetry.status).toBe(201);
-    await expect(lostResponseRetry.json()).resolves.toMatchObject({ invoice: { id: created.invoice.id } });
+    const replayed = await lostResponseRetry.json() as DraftResult & { requestId: string };
+    expect(replayed.requestId).toBe("invoice-api-retry");
+    expect({ ...replayed, requestId: created.requestId }).toEqual(created);
+    const conflictingRetry = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+      intent: "SAVE_DRAFT", invoice: { notes: "different payload", items: [] },
+    }, authCookie, csrfData.token, csrfData.cookie, "invoice-api-conflict", "invoice-api-test-key"));
+    expect(conflictingRetry.status).toBe(409);
+    await expect(conflictingRetry.json()).resolves.toMatchObject({ error: {
+      code: apiErrorCodes.IDEMPOTENCY_KEY_REUSED,
+      fieldErrors: { idempotencyKey: "IDEMPOTENCY_KEY_REUSED" },
+      requestId: "invoice-api-conflict",
+    } });
     expect((temporary.connection.client.prepare("select count(*) as count from invoices").get() as { count: bigint }).count).toBe(1n);
     expect((temporary.connection.client.prepare("select last_value as value from invoice_sequences").get() as { value: bigint }).value).toBe(1n);
     const fetchedResponse = await GET(new Request(`http://127.0.0.1:3000/api/invoices/${created.invoice.id}`, {
@@ -155,9 +169,8 @@ describe("invoice draft API", () => {
     }, authCookie, csrfData.token, csrfData.cookie));
     expect(patchedResponse.status).toBe(200);
     await expect(patchedResponse.json()).resolves.toMatchObject({ invoice: { notes: "معدلة", rowVersion: 2, items: [] } });
-    const immutableRetryResponse = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
-      intent: "SAVE_DRAFT", invoice: { notes: "a later retry body must be ignored", items: [] },
-    }, authCookie, csrfData.token, csrfData.cookie, "invoice-api-retry-after-edit", "invoice-api-test-key"));
+    const immutableRetryResponse = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", createBody,
+      authCookie, csrfData.token, csrfData.cookie, "invoice-api-retry-after-edit", "invoice-api-test-key"));
     expect(immutableRetryResponse.status).toBe(201);
     const immutableRetry = await immutableRetryResponse.json() as DraftResult & { requestId: string };
     expect(immutableRetry.requestId).toBe("invoice-api-retry-after-edit");

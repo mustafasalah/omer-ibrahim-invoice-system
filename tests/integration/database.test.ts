@@ -1,3 +1,13 @@
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { checkDatabase, migrateDatabase, openDatabase } from "@/server/db/connection";
@@ -27,6 +37,7 @@ describe("SQLite foundation", () => {
         "beneficiaries",
         "dealer_logos",
         "invoice_dealer_logos",
+        "invoice_idempotency_records",
         "invoice_items",
         "invoice_print_snapshots",
         "invoice_sequences",
@@ -41,7 +52,7 @@ describe("SQLite foundation", () => {
       const migrationCount = temporary.connection.client
         .prepare("select count(*) as count from __drizzle_migrations")
         .get() as { count: bigint };
-      expect(migrationCount.count).toBe(1n);
+      expect(migrationCount.count).toBe(2n);
     } finally {
       temporary.dispose();
     }
@@ -56,7 +67,7 @@ describe("SQLite foundation", () => {
         journalMode: "wal",
         foreignKeys: true,
         busyTimeoutMs: 5_000,
-        schemaVersion: 1,
+        schemaVersion: 2,
       });
 
       const rawInteger = temporary.connection.client.prepare("select 1 as value").get() as {
@@ -65,6 +76,183 @@ describe("SQLite foundation", () => {
       expect(rawInteger.value).toBe(1n);
     } finally {
       temporary.dispose();
+    }
+  });
+
+  it("upgrades schema version 1, removes legacy replay data, and preserves the audit event", () => {
+    const temporaryRoot = path.resolve(tmpdir());
+    const directory = mkdtempSync(path.join(temporaryRoot, "oims-v1-upgrade-test-"));
+    const versionOneMigrations = path.join(directory, "v1-migrations");
+    const versionOneMeta = path.join(versionOneMigrations, "meta");
+    const currentMigrations = path.resolve(process.cwd(), "drizzle");
+    const connection = openDatabase(path.join(directory, "version-one.sqlite"));
+
+    try {
+      mkdirSync(versionOneMeta, { recursive: true });
+      copyFileSync(
+        path.join(currentMigrations, "0000_supreme_blink.sql"),
+        path.join(versionOneMigrations, "0000_supreme_blink.sql"),
+      );
+
+      const currentJournal = JSON.parse(
+        readFileSync(path.join(currentMigrations, "meta", "_journal.json"), "utf8"),
+      ) as {
+        dialect: string;
+        entries: Array<Record<string, unknown>>;
+        version: string;
+      };
+      writeFileSync(
+        path.join(versionOneMeta, "_journal.json"),
+        `${JSON.stringify(
+          {
+            ...currentJournal,
+            entries: currentJournal.entries.slice(0, 1),
+          },
+          null,
+          2,
+        )}\n`,
+        "utf8",
+      );
+
+      migrateDatabase(connection, versionOneMigrations);
+
+      const versionOneMigrationCount = connection.client
+        .prepare("select count(*) as count from __drizzle_migrations")
+        .get() as { count: bigint };
+      const idempotencyTableBeforeUpgrade = connection.client
+        .prepare(
+          "select count(*) as count from sqlite_master where type = 'table' and name = 'invoice_idempotency_records'",
+        )
+        .get() as { count: bigint };
+
+      expect(versionOneMigrationCount.count).toBe(1n);
+      expect(idempotencyTableBeforeUpgrade.count).toBe(0n);
+
+      const now = "2026-08-26T00:00:00.000Z";
+      connection.client
+        .prepare(
+          `insert into users (
+            id, username, display_name, role, password_hash, created_at, updated_at
+          ) values (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("legacy-user", "legacy-admin", "Legacy Admin", "ADMIN", "legacy-hash", now, now);
+      connection.client
+        .prepare(
+          `insert into invoices (
+            id, invoice_number, invoice_date, currency_code, currency_symbol,
+            currency_decimals, created_at, created_by, updated_at, updated_by
+          ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "legacy-invoice",
+          "OI-2026-00001",
+          "2026-08-26",
+          "SDG",
+          "SDG",
+          2,
+          now,
+          "legacy-user",
+          now,
+          "legacy-user",
+        );
+
+      const legacyChanges = {
+        invoiceStatus: { before: null, after: "DRAFT" },
+        createIdempotencyKey: "legacy-raw-idempotency-key",
+        createReplay: {
+          version: 1,
+          result: {
+            invoice: {
+              id: "legacy-invoice",
+              beneficiary: { name: "Sensitive beneficiary" },
+              items: [{ description: "Sensitive item", unitPrice: "99.99" }],
+            },
+            totals: { grandTotal: "99.99" },
+          },
+        },
+        retainedMetadata: { source: "milestone-one", keep: true },
+        nestedMetadata: { createReplay: "this nested unrelated value must remain" },
+      };
+      connection.client
+        .prepare(
+          `insert into audit_logs (
+            id, event_type, actor_user_id, actor_display_name, invoice_id,
+            invoice_number, entity_type, entity_id, summary, changes_json,
+            created_at, request_id
+          ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "legacy-audit",
+          "INVOICE_CREATED",
+          "legacy-user",
+          "Legacy Admin",
+          "legacy-invoice",
+          "OI-2026-00001",
+          "INVOICE",
+          "legacy-invoice",
+          "Legacy invoice created",
+          JSON.stringify(legacyChanges),
+          now,
+          "legacy-request",
+        );
+
+      migrateDatabase(connection, currentMigrations);
+
+      const upgradedMigrationCount = connection.client
+        .prepare("select count(*) as count from __drizzle_migrations")
+        .get() as { count: bigint };
+      const idempotencyRecordCount = connection.client
+        .prepare("select count(*) as count from invoice_idempotency_records")
+        .get() as { count: bigint };
+      const storedAudit = connection.client
+        .prepare("select event_type, summary, changes_json from audit_logs where id = ?")
+        .get("legacy-audit") as {
+        changes_json: string;
+        event_type: string;
+        summary: string;
+      };
+
+      expect(upgradedMigrationCount.count).toBe(2n);
+      expect(idempotencyRecordCount.count).toBe(0n);
+      expect(storedAudit.event_type).toBe("INVOICE_CREATED");
+      expect(storedAudit.summary).toBe("Legacy invoice created");
+      expect(JSON.parse(storedAudit.changes_json)).toEqual({
+        invoiceStatus: { before: null, after: "DRAFT" },
+        retainedMetadata: { source: "milestone-one", keep: true },
+        nestedMetadata: { createReplay: "this nested unrelated value must remain" },
+      });
+
+      expect(() =>
+        connection.client
+          .prepare("update audit_logs set summary = ? where id = ?")
+          .run("changed", "legacy-audit"),
+      ).toThrow(/append-only/);
+      expect(() =>
+        connection.client.prepare("delete from audit_logs where id = ?").run("legacy-audit"),
+      ).toThrow(/append-only/);
+
+      migrateDatabase(connection, currentMigrations);
+
+      const afterSecondMigration = connection.client
+        .prepare("select count(*) as count from __drizzle_migrations")
+        .get() as { count: bigint };
+      const auditAfterSecondMigration = connection.client
+        .prepare("select count(*) as count from audit_logs where id = ?")
+        .get("legacy-audit") as { count: bigint };
+
+      expect(afterSecondMigration.count).toBe(2n);
+      expect(auditAfterSecondMigration.count).toBe(1n);
+      expect(checkDatabase(connection).schemaVersion).toBe(2);
+    } finally {
+      connection.client.close();
+      const resolvedDirectory = path.resolve(directory);
+      const relative = path.relative(temporaryRoot, resolvedDirectory);
+
+      if (relative.startsWith("..") || path.isAbsolute(relative) || relative === "") {
+        throw new Error("Refusing to remove a directory outside the test temp root.");
+      }
+
+      rmSync(resolvedDirectory, { force: true, recursive: true });
     }
   });
 

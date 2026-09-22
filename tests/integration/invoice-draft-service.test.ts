@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { createInvoiceDraft, getInvoiceDraft, updateInvoiceDraft, type InvoiceFaultPoint } from "@/server/invoices/service";
+import { createInvoiceDraft as createInvoiceDraftService, getInvoiceDraft, updateInvoiceDraft,
+  type InvoiceFaultPoint } from "@/server/invoices/service";
 import { apiErrorCodes } from "@/server/http/errors";
+import { fingerprintIdempotencyRequest, hashIdempotencyKey } from "@/server/idempotency/service";
 import { getSettings } from "@/server/settings/service";
 import { createTestAdmin } from "../fixtures/auth";
 import { createTemporaryDatabase, type TemporaryDatabase } from "../fixtures/database";
@@ -15,6 +17,16 @@ const draft = (overrides: Record<string, unknown> = {}) => ({ intent: "SAVE_DRAF
     { clientKey: "b", productName: "غير مكتمل", quantity: "3" }], notes: "مسودة", ...overrides,
 } });
 
+type CreateDraftOptions = Parameters<typeof createInvoiceDraftService>[0];
+function createInvoiceDraft(options: Omit<CreateDraftOptions, "idempotencyKey"> & {
+  idempotencyKey?: string;
+}) {
+  return createInvoiceDraftService({
+    ...options,
+    idempotencyKey: options.idempotencyKey ?? `test-draft-${options.requestId}`,
+  });
+}
+
 async function setup() {
   temporary = createTemporaryDatabase(); const admin = await createTestAdmin(temporary.connection);
   return { connection: temporary.connection, actor: { id: admin.id, displayName: admin.displayName, role: admin.role } };
@@ -23,14 +35,15 @@ async function setup() {
 describe("atomic invoice draft persistence", () => {
   it("deduplicates a lost create response by actor and operation without reserving another number", async () => {
     const { connection, actor } = await setup();
-    const first = createInvoiceDraft({ connection, actor, input: draft({ invoiceDate: "2026-08-28" }),
-      requestId: "lost-create-response", idempotencyKey: "lost-create-operation-001", now });
+    const idempotencyKey = "lost-create-operation-001";
+    const originalInput = draft({ invoiceDate: "2026-08-28" });
+    const first = createInvoiceDraft({ connection, actor, input: originalInput,
+      requestId: "lost-create-response", idempotencyKey, now });
     const updated = updateInvoiceDraft({ connection, actor, id: first.invoice.id, requestId: "later-update", now,
       input: { rowVersion: first.invoice.rowVersion, invoice: { notes: "a later committed edit", items: [] } } });
     expect(updated.invoice.rowVersion).toBe(2);
     const retried = createInvoiceDraft({ connection, actor,
-      input: draft({ notes: "must not replace the completed operation" }), requestId: "retry-http-request",
-      idempotencyKey: "lost-create-operation-001", now });
+      input: originalInput, requestId: "retry-http-request", idempotencyKey, now });
     expect(retried).toEqual(first);
     expect(retried.invoice.rowVersion).toBe(1);
     expect(retried.invoice.notes).toBe(first.invoice.notes);
@@ -39,10 +52,116 @@ describe("atomic invoice draft persistence", () => {
     expect((connection.client.prepare("select last_value as value from invoice_sequences where sequence_key='invoice:2026'").get() as { value: bigint }).value).toBe(1n);
     expect((connection.client.prepare("select count(*) as count from audit_logs where event_type='INVOICE_CREATED'")
       .get() as { count: bigint }).count).toBe(1n);
-    const storedReplay = (connection.client.prepare("select changes_json as changesJson from audit_logs where event_type='INVOICE_CREATED'")
-      .get() as { changesJson: string }).changesJson;
-    expect(JSON.parse(storedReplay)).toMatchObject({ createReplay: { version: 1, result: first } });
-    expect(storedReplay).not.toMatch(/password|session|cookie|csrf|token|hash/iu);
+    const stored = connection.client.prepare(`select key_hash as keyHash,response_status as responseStatus,
+      response_json as responseJson from invoice_idempotency_records`).get() as {
+        keyHash: string; responseStatus: bigint; responseJson: string;
+      };
+    expect(stored.keyHash).toBe(hashIdempotencyKey(idempotencyKey));
+    expect(stored.keyHash).not.toContain(idempotencyKey);
+    expect(stored.responseStatus).toBe(201n);
+    expect(JSON.parse(stored.responseJson)).toEqual({ version: 1, result: first });
+    const auditChanges = (connection.client.prepare(`select changes_json as changesJson from audit_logs
+      where event_type='INVOICE_CREATED'`).get() as { changesJson: string }).changesJson;
+    expect(JSON.parse(auditChanges)).toEqual({ invoiceStatus: { before: null, after: "DRAFT" } });
+    expect(auditChanges).not.toContain(idempotencyKey);
+    expect(auditChanges).not.toContain(stored.keyHash);
+  });
+
+  it("rejects reuse with a different payload without changing persisted artifacts", async () => {
+    const { connection, actor } = await setup();
+    const idempotencyKey = "payload-conflict-key-001";
+    const first = createInvoiceDraft({ connection, actor, input: draft(), requestId: "payload-first",
+      idempotencyKey, now });
+    const before = Object.fromEntries(["invoices", "invoice_sequences", "audit_logs",
+      "invoice_idempotency_records"].map((table) => [table,
+      (connection.client.prepare(`select count(*) as count from ${table}`).get() as { count: bigint }).count]));
+    expect(() => createInvoiceDraft({ connection, actor,
+      input: draft({ notes: "different payload" }), requestId: "payload-second",
+      idempotencyKey, now })).toThrowError(expect.objectContaining({
+        code: apiErrorCodes.IDEMPOTENCY_KEY_REUSED, status: 409,
+      }));
+    expect(getInvoiceDraft(first.invoice.id, { connection })).toEqual(first.invoice);
+    for (const [table, count] of Object.entries(before)) {
+      expect((connection.client.prepare(`select count(*) as count from ${table}`).get() as {
+        count: bigint;
+      }).count, table).toBe(count);
+    }
+  });
+
+  it("scopes the same key to both the user and operation", async () => {
+    const { connection, actor } = await setup();
+    const idempotencyKey = "shared-scope-key-0001";
+    const input = draft();
+    const first = createInvoiceDraft({ connection, actor, input, requestId: "scope-admin",
+      idempotencyKey, now });
+    const timestamp = now.toISOString();
+    connection.client.prepare(`insert into users (id,username,display_name,role,password_hash,is_active,
+      must_change_password,failed_login_count,created_at,updated_at,row_version)
+      values (?,?,?,?,?,1,0,0,?,?,1)`).run(
+        "scope-employee", "scope-employee", "Scoped Employee", "EMPLOYEE", "unused", timestamp, timestamp,
+      );
+    const employee = { id: "scope-employee", displayName: "Scoped Employee", role: "EMPLOYEE" as const };
+    const second = createInvoiceDraft({ connection, actor: employee, input, requestId: "scope-employee",
+      idempotencyKey, now });
+    expect(second.invoice.id).not.toBe(first.invoice.id);
+
+    const operationKey = "other-operation-key-01";
+    connection.client.prepare(`insert into invoice_idempotency_records
+      (id,user_id,operation,key_hash,request_fingerprint,response_status,response_json,created_at,expires_at)
+      values (?,?,?,?,?,?,?,?,?)`).run(
+        "other-operation-record", actor.id, "OTHER_OPERATION", hashIdempotencyKey(operationKey),
+        fingerprintIdempotencyRequest(input), 200, "{}", timestamp, "2026-09-03T08:00:00.000Z",
+      );
+    const third = createInvoiceDraft({ connection, actor, input, requestId: "scope-operation",
+      idempotencyKey: operationKey, now });
+    expect(third.invoice.id).not.toBe(first.invoice.id);
+    expect(connection.client.prepare(`select user_id as userId,operation from invoice_idempotency_records
+      order by user_id,operation,key_hash`).all()).toEqual(expect.arrayContaining([
+        { userId: actor.id, operation: "OTHER_OPERATION" },
+        { userId: actor.id, operation: "SAVE_DRAFT" },
+        { userId: employee.id, operation: "SAVE_DRAFT" },
+      ]));
+  });
+
+  it("replays for seven days, then expires the key and creates a fresh operation", async () => {
+    const { connection, actor } = await setup();
+    const idempotencyKey = "retention-window-key-01";
+    const input = draft();
+    const first = createInvoiceDraft({ connection, actor, input, requestId: "retention-first",
+      idempotencyKey, now });
+    const beforeExpiry = new Date(now.getTime() + (7 * 24 * 60 * 60 * 1_000) - 1);
+    expect(createInvoiceDraft({ connection, actor, input, requestId: "retention-replay",
+      idempotencyKey, now: beforeExpiry })).toEqual(first);
+    const atExpiry = new Date(now.getTime() + (7 * 24 * 60 * 60 * 1_000));
+    const replacement = createInvoiceDraft({ connection, actor, input, requestId: "retention-replacement",
+      idempotencyKey, now: atExpiry });
+    expect(replacement.invoice.id).not.toBe(first.invoice.id);
+    expect(replacement.invoice.invoiceNumber).toBe("OI-2026-00002");
+    expect((connection.client.prepare("select count(*) as count from invoice_idempotency_records").get() as {
+      count: bigint;
+    }).count).toBe(1n);
+  });
+
+  it("removes only one bounded batch of expired records and preserves active records", async () => {
+    const { connection, actor } = await setup();
+    const insert = connection.client.prepare(`insert into invoice_idempotency_records
+      (id,user_id,operation,key_hash,request_fingerprint,response_status,response_json,created_at,expires_at)
+      values (?,?,?,?,?,?,?,?,?)`);
+    for (let index = 0; index < 27; index += 1) {
+      insert.run(`expired-${index}`, actor.id, "SAVE_DRAFT", hashIdempotencyKey(`expired-key-${index}`),
+        "a".repeat(64), 201, "{}", "2026-08-20T00:00:00.000Z", "2026-08-26T00:00:00.000Z");
+    }
+    insert.run("active-record", actor.id, "SAVE_DRAFT", hashIdempotencyKey("active-key"),
+      "b".repeat(64), 201, "{}", "2026-08-26T00:00:00.000Z", "2026-09-02T00:00:00.000Z");
+    createInvoiceDraft({ connection, actor, input: draft(), requestId: "cleanup-trigger",
+      idempotencyKey: "cleanup-trigger-key-01", now });
+    expect((connection.client.prepare(`select count(*) as count from invoice_idempotency_records
+      where expires_at<=?`).get(now.toISOString()) as { count: bigint }).count).toBe(2n);
+    expect(connection.client.prepare("select id from invoice_idempotency_records where id='active-record'").get())
+      .toEqual({ id: "active-record" });
+    expect((connection.client.prepare("select count(*) as count from invoice_idempotency_records").get() as {
+      count: bigint;
+    }).count).toBe(4n);
   });
 
   it("covers AT-LIFE-001 and AT-NUM-002 by saving incomplete drafts with server totals and sequential numbers", async () => {
@@ -146,6 +265,12 @@ describe("atomic invoice draft persistence", () => {
     expect(events).toHaveLength(2);
     expect(events[0]).toMatchObject({ eventType: "INVOICE_CREATED", invoiceId: created.invoice.id,
       invoiceNumber: created.invoice.invoiceNumber, requestId: "audit-create" });
+    const createChanges = JSON.parse(events[0]?.changesJson ?? "{}") as Record<string, unknown>;
+    expect(createChanges).toEqual({ invoiceStatus: { before: null, after: "DRAFT" } });
+    expect(Object.keys(createChanges)).not.toEqual(expect.arrayContaining([
+      "beneficiary", "items", "prices", "totals", "responseJson", "createReplay",
+      "createIdempotencyKey", "keyHash",
+    ]));
     expect(events[1]).toMatchObject({ eventType: "INVOICE_DRAFT_UPDATED", requestId: "audit-update" });
     expect(JSON.parse(events[1]?.changesJson ?? "{}")).toMatchObject({ notes: { before: "مسودة", after: "بعد" } });
     expect(JSON.stringify(events)).not.toMatch(/password|session|cookie|csrf|hash/iu);
@@ -182,25 +307,29 @@ describe("atomic invoice draft persistence", () => {
       input: { rowVersion: 2, invoice: { items: [] } } })).toThrowError(expect.objectContaining({ status: 409 }));
   });
 
-  it.each<InvoiceFaultPoint>(["afterSequence", "afterSuggestions", "afterInvoice", "afterItems", "afterAudit"])(
+  it.each<InvoiceFaultPoint>(["afterSequence", "afterSuggestions", "afterInvoice", "afterItems", "afterAudit",
+    "afterIdempotency"])(
     "rolls back every artifact for injected failure at %s", async (point) => {
       const { connection, actor } = await setup();
       connection.client.prepare("insert into invoice_sequences (sequence_key,last_value,updated_at) values (?,?,?)")
         .run("invoice:2026", 40, now.toISOString());
       const baselines = new Map<string, bigint>();
-      for (const table of ["invoice_sequences", "beneficiaries", "products", "invoices", "invoice_items", "audit_logs"]) {
+      for (const table of ["invoice_sequences", "beneficiaries", "products", "invoices", "invoice_items",
+        "audit_logs", "invoice_idempotency_records"]) {
         baselines.set(table, (connection.client.prepare(`select count(*) as count from ${table}`).get() as { count: bigint }).count);
       }
       expect(() => createInvoiceDraft({ connection, actor, input: draft(), requestId: `fault-${point}`, now,
+        idempotencyKey: `fault-key-${point}`,
         faultInjector: (current) => { if (current === point) throw new Error(`fault:${point}`); } })).toThrow();
-      for (const table of ["invoice_sequences", "beneficiaries", "products", "invoices", "invoice_items", "audit_logs"]) {
+      for (const table of ["invoice_sequences", "beneficiaries", "products", "invoices", "invoice_items",
+        "audit_logs", "invoice_idempotency_records"]) {
         const result = connection.client.prepare(`select count(*) as count from ${table}`).get() as { count: bigint };
         expect(result.count, table).toBe(baselines.get(table));
       }
       expect(connection.client.prepare("select last_value as lastValue from invoice_sequences where sequence_key=?")
         .get("invoice:2026")).toEqual({ lastValue: 40n });
       const recovered = createInvoiceDraft({ connection, actor, input: draft(),
-        requestId: `recovered-${point}`, now });
+        requestId: `recovered-${point}`, idempotencyKey: `fault-key-${point}`, now });
       expect(recovered.invoice.invoiceNumber).toBe("OI-2026-00041");
       expect(connection.client.pragma("quick_check", { simple: true })).toBe("ok");
     });

@@ -307,6 +307,7 @@ export const arMessages = {
     invoiceIssued: "إصدار فاتورة",
   },
   errors: {
+    idempotencyKeyReused: "استُخدم مفتاح حفظ المسودة سابقًا مع بيانات مختلفة.",
     invalidIdempotencyKey: "مفتاح حفظ المسودة مفقود أو غير صالح.",
     internal: "تعذر إكمال الطلب.",
     serviceUnavailable: "الخدمة المحلية غير جاهزة.",

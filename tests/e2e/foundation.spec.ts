@@ -170,7 +170,14 @@ test("setup → login → settings → create and edit draft → logout", async 
   await productNames.nth(1).fill("بند غير مكتمل");
   await expect(page.locator(".invoice-item__hint")).toContainText("البند غير المكتمل لا يدخل في المعاينة");
 
+  const draftCreateRequest = page.waitForRequest((request) => request.url().endsWith("/api/invoices")
+    && request.method() === "POST"
+    && (request.postDataJSON() as { intent?: string }).intent === "SAVE_DRAFT");
   await page.getByRole("button", { name: "حفظ كمسودة" }).click();
+  const draftCreateHeaders = (await draftCreateRequest).headers();
+  expect(draftCreateHeaders["idempotency-key"]).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u);
+  expect(draftCreateHeaders["x-request-id"]).toMatch(/^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/u);
+  expect(draftCreateHeaders["idempotency-key"]).not.toBe(draftCreateHeaders["x-request-id"]);
   await expect(page).toHaveURL(/\/invoices\/[0-9A-HJKMNP-TV-Z]{26}\/edit(?:\?saved=1)?$/u);
   const editUrl = page.url();
   const invoiceId = /\/invoices\/([^/]+)\/edit/u.exec(new URL(editUrl).pathname)?.[1];
@@ -297,5 +304,5 @@ test("setup → login → settings → create and edit draft → logout", async 
   const healthResponse = await request.get("/api/health", { headers: { "x-request-id": "e2e-health" } });
   expect(healthResponse.ok()).toBe(true);
   expect(healthResponse.headers()["x-request-id"]).toBe("e2e-health");
-  await expect(healthResponse.json()).resolves.toMatchObject({ status: "ok", checks: { database: "ok", schemaVersion: 1 }, requestId: "e2e-health" });
+  await expect(healthResponse.json()).resolves.toMatchObject({ status: "ok", checks: { database: "ok", schemaVersion: 2 }, requestId: "e2e-health" });
 });

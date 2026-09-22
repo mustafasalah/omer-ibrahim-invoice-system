@@ -91,6 +91,46 @@ export const sessions = sqliteTable(
   ],
 );
 
+export const invoiceIdempotencyRecords = sqliteTable(
+  "invoice_idempotency_records",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, restrictedReference),
+    operation: text("operation").notNull(),
+    keyHash: text("key_hash").notNull(),
+    requestFingerprint: text("request_fingerprint").notNull(),
+    responseStatus: integer("response_status").notNull(),
+    responseJson: text("response_json").notNull(),
+    createdAt: text("created_at").notNull(),
+    expiresAt: text("expires_at").notNull(),
+  },
+  (table) => [
+    uniqueIndex("invoice_idempotency_user_operation_key_unique")
+      .on(table.userId, table.operation, table.keyHash),
+    index("invoice_idempotency_expires_idx").on(table.expiresAt, table.id),
+    check(
+      "invoice_idempotency_operation_valid",
+      sql`length(trim(${table.operation})) between 1 and 64`,
+    ),
+    check(
+      "invoice_idempotency_key_hash_valid",
+      sql`length(${table.keyHash}) = 64 and ${table.keyHash} not glob '*[^0-9a-f]*'`,
+    ),
+    check(
+      "invoice_idempotency_request_fingerprint_valid",
+      sql`length(${table.requestFingerprint}) = 64 and ${table.requestFingerprint} not glob '*[^0-9a-f]*'`,
+    ),
+    check(
+      "invoice_idempotency_response_status_valid",
+      sql`${table.responseStatus} between 100 and 599`,
+    ),
+    check("invoice_idempotency_response_json_valid", sql`json_valid(${table.responseJson})`),
+    check("invoice_idempotency_expiry_valid", sql`${table.expiresAt} > ${table.createdAt}`),
+  ],
+);
+
 export const mediaAssets = sqliteTable(
   "media_assets",
   {
@@ -569,6 +609,7 @@ export const schema = {
   beneficiaries,
   dealerLogos,
   invoiceDealerLogos,
+  invoiceIdempotencyRecords,
   invoiceItems,
   invoicePrintSnapshots,
   invoiceSequences,

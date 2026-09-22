@@ -1,11 +1,16 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { getSettings, updateSettings } from "@/server/settings/service";
-import { createInvoiceDraft } from "@/server/invoices/service";
+import { createInvoiceDraft as createInvoiceDraftService } from "@/server/invoices/service";
 import { apiErrorCodes } from "@/server/http/errors";
 import { createTestAdmin } from "../fixtures/auth";
 import { createTemporaryDatabase, type TemporaryDatabase } from "../fixtures/database";
 
 let temporary: TemporaryDatabase | undefined;
+
+type CreateDraftOptions = Parameters<typeof createInvoiceDraftService>[0];
+function createInvoiceDraft(options: Omit<CreateDraftOptions, "idempotencyKey">) {
+  return createInvoiceDraftService({ ...options, idempotencyKey: `test-settings-${options.requestId}` });
+}
 afterEach(() => { temporary?.dispose(); temporary = undefined; });
 
 function changedSettings(overrides: Record<string, unknown> = {}) {

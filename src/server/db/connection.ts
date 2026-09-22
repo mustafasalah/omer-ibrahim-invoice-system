@@ -10,7 +10,7 @@ import { schema } from "./schema";
 
 export const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 export const DEFAULT_DATABASE_FILENAME = "oims.sqlite";
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 2;
 
 export type AppDatabase = BetterSQLite3Database<typeof schema>;
 

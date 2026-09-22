@@ -2,11 +2,17 @@ import { afterEach, describe, expect, it } from "vitest";
 import { GET } from "@/app/api/invoices/[id]/route";
 import { createSessionToken, insertSession } from "@/server/auth/sessions";
 import { apiErrorCodes } from "@/server/http/errors";
-import { createInvoiceDraft, createIssuedInvoice, getInvoiceDraft } from "@/server/invoices/service";
+import { createInvoiceDraft as createInvoiceDraftService, createIssuedInvoice,
+  getInvoiceDraft } from "@/server/invoices/service";
 import { createTestAdmin } from "../fixtures/auth";
 import { createTemporaryDatabase, type TemporaryDatabase } from "../fixtures/database";
 
 let temporary: TemporaryDatabase | undefined;
+
+type CreateDraftOptions = Parameters<typeof createInvoiceDraftService>[0];
+function createInvoiceDraft(options: Omit<CreateDraftOptions, "idempotencyKey">) {
+  return createInvoiceDraftService({ ...options, idempotencyKey: `test-details-${options.requestId}` });
+}
 
 afterEach(() => {
   globalThis.__oimsDatabaseConnection = undefined;

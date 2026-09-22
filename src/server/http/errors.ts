@@ -11,6 +11,7 @@ export const apiErrorCodes = {
   FORBIDDEN: "FORBIDDEN",
   INTERNAL_ERROR: "INTERNAL_ERROR",
   INVALID_IDEMPOTENCY_KEY: "INVALID_IDEMPOTENCY_KEY",
+  IDEMPOTENCY_KEY_REUSED: "IDEMPOTENCY_KEY_REUSED",
   INVALID_CREDENTIALS: "INVALID_CREDENTIALS",
   LOGIN_RATE_LIMITED: "LOGIN_RATE_LIMITED",
   NOT_FOUND: "NOT_FOUND",
@@ -124,6 +125,15 @@ export function invalidIdempotencyKeyError(): AppError {
     message: getMessages().errors.invalidIdempotencyKey,
     status: 422,
     fieldErrors: { idempotencyKey: "INVALID_IDEMPOTENCY_KEY" },
+  });
+}
+
+export function idempotencyKeyReusedError(): AppError {
+  return new AppError({
+    code: apiErrorCodes.IDEMPOTENCY_KEY_REUSED,
+    message: getMessages().errors.idempotencyKeyReused,
+    status: 409,
+    fieldErrors: { idempotencyKey: "IDEMPOTENCY_KEY_REUSED" },
   });
 }
 

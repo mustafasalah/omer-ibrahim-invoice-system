@@ -309,6 +309,7 @@ export const enMessages = {
     invoiceIssued: "Issued an invoice",
   },
   errors: {
+    idempotencyKeyReused: "The draft save key was already used with different data.",
     internal: "The request could not be completed.",
     serviceUnavailable: "The local service is not ready.",
     validation: "Check the submitted data.",

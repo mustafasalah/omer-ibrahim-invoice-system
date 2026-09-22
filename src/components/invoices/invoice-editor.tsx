@@ -93,7 +93,7 @@ export function InvoiceEditor({
   const conflictRef = useRef<HTMLElement>(null);
   const issueDialogRef = useRef<HTMLDivElement>(null);
   const issueButtonRef = useRef<HTMLButtonElement>(null);
-  const saveRequestIdRef = useRef<string | null>(null);
+  const saveIdempotencyKeyRef = useRef<string | null>(null);
   const saveInFlightRef = useRef(false);
   const issueRequestIdRef = useRef<string | null>(null);
   const issueInFlightRef = useRef(false);
@@ -134,8 +134,9 @@ export function InvoiceEditor({
 
     const requestFingerprint = editorDraftFingerprint(invoice);
     const isCreate = invoice.id === null;
-    const requestId = isCreate ? saveRequestIdRef.current ?? newClientKey() : null;
-    if (isCreate && requestId) saveRequestIdRef.current = requestId;
+    const idempotencyKey = isCreate ? saveIdempotencyKeyRef.current ?? newClientKey() : null;
+    if (isCreate && idempotencyKey) saveIdempotencyKeyRef.current = idempotencyKey;
+    const requestId = isCreate ? newClientKey() : null;
     saveInFlightRef.current = true;
     setStatus("saving");
     setStatusMessage("");
@@ -149,14 +150,16 @@ export function InvoiceEditor({
         method: isCreate ? "POST" : "PATCH",
         credentials: "same-origin",
         headers: { "content-type": "application/json", "x-csrf-token": csrf,
-          ...(requestId ? { "x-request-id": requestId, "idempotency-key": requestId } : {}) },
+          ...(requestId && idempotencyKey
+            ? { "x-request-id": requestId, "idempotency-key": idempotencyKey }
+            : {}) },
         body: JSON.stringify(isCreate
           ? { intent: "SAVE_DRAFT", invoice: toDraftInput(invoice) }
           : { rowVersion: invoice.rowVersion, invoice: toDraftInput(invoice) }),
       });
       const body = await response.json() as ApiErrorBody & { invoice?: unknown; warnings?: Array<{ code?: string }> };
       if (!response.ok) {
-        if (isCreate && response.status !== 500) saveRequestIdRef.current = null;
+        if (isCreate && response.status !== 500) saveIdempotencyKeyRef.current = null;
         setFieldErrors(body.error?.fieldErrors ?? {});
         setStatusMessage(body.error?.message ?? messages.unavailable);
         if (response.status === 401) { router.replace("/login"); return; }
@@ -174,7 +177,7 @@ export function InvoiceEditor({
         setStatusMessage(messages.malformed);
         return;
       }
-      if (isCreate) saveRequestIdRef.current = null;
+      if (isCreate) saveIdempotencyKeyRef.current = null;
       const reconciled = reconcileSavedInvoice(invoiceRef.current, saved, requestFingerprint);
       invoiceRef.current = reconciled.state;
       setInvoice(reconciled.state);

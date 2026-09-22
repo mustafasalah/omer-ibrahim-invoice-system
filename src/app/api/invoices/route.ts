@@ -18,11 +18,13 @@ export const POST = withApiHandler(async ({ request, requestId }) => {
   const intent = readInvoiceIntent(input);
   if (!intent) throw validationError({ intent: "INVALID_INTENT" });
   assertCapability(session, intent === "ISSUE" ? "invoice.issue" : "invoice.create");
-  const result = (intent === "ISSUE" ? createIssuedInvoice : createInvoiceDraft)({
+  const operation = {
     input,
     actor: { id: session.user.id, displayName: session.user.displayName, role: session.user.role },
     requestId,
-    ...(intent === "SAVE_DRAFT" ? { idempotencyKey: requireIdempotencyKey(request) } : {}),
-  });
+  };
+  const result = intent === "ISSUE"
+    ? createIssuedInvoice(operation)
+    : createInvoiceDraft({ ...operation, idempotencyKey: requireIdempotencyKey(request) });
   return NextResponse.json({ ...result, requestId }, { status: 201, headers: { "cache-control": "no-store" } });
 });

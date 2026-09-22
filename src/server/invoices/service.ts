@@ -13,7 +13,16 @@ import { getMessages } from "@/i18n";
 import { appendAuditEvent, type AuditEvent } from "@/server/audit/service";
 import { getDatabase, type DatabaseConnection } from "@/server/db/connection";
 import { withImmediateTransaction } from "@/server/db/transaction";
-import { conflictError, forbiddenError, notFoundError, validationError } from "@/server/http/errors";
+import { conflictError, forbiddenError, idempotencyKeyReusedError, notFoundError,
+  validationError } from "@/server/http/errors";
+import {
+  cleanupExpiredIdempotencyRecords,
+  deleteInvoiceIdempotencyRecord,
+  findInvoiceIdempotencyRecord,
+  fingerprintIdempotencyRequest,
+  hashIdempotencyKey,
+  insertInvoiceIdempotencyRecord,
+} from "@/server/idempotency/service";
 import { insertDefaultSettings } from "@/server/settings/defaults";
 import { reserveInvoiceNumber } from "./numbering";
 import { capturePrintSnapshot, readPrintSnapshot } from "./print-snapshot";
@@ -61,7 +70,7 @@ type PreparedBeneficiary = DraftBeneficiaryInput & { row: BeneficiaryRow | null 
 type PreparedItem = DraftItemInput & { row: ProductRow | null; productId: string | null };
 
 export type InvoiceFaultPoint = "afterSequence" | "afterSuggestions" | "afterInvoice" | "afterItems" |
-  "afterSnapshot" | "afterStatus" | "afterAudit";
+  "afterSnapshot" | "afterStatus" | "afterAudit" | "afterIdempotency";
 type FaultInjector = (point: InvoiceFaultPoint) => void;
 type AuditAppender = (connection: DatabaseConnection, event: AuditEvent) => void;
 type SnapshotCapturer = typeof capturePrintSnapshot;
@@ -367,17 +376,27 @@ export function getInvoiceDraft(id: string, options: { connection?: DatabaseConn
 }
 
 export function createInvoiceDraft(options: { input: unknown; actor: DraftActor; requestId: string;
-  idempotencyKey?: string; connection?: DatabaseConnection; now?: Date;
+  idempotencyKey: string; connection?: DatabaseConnection; now?: Date;
   faultInjector?: FaultInjector; auditAppender?: AuditAppender }): DraftResult {
   let request;
   try { request = parseCreateDraft(options.input); }
   catch (error) { if (error instanceof DraftValidationError) throw validationError(error.fieldErrors); throw error; }
   const connection = options.connection ?? getDatabase();
   const at = options.now ?? new Date(); const now = at.toISOString();
-  const idempotencyKey = options.idempotencyKey ?? options.requestId;
+  const keyHash = hashIdempotencyKey(options.idempotencyKey);
+  const requestFingerprint = fingerprintIdempotencyRequest(options.input);
   return withImmediateTransaction(connection.client, () => {
-    const repeated = previousDraftCreationRequest(connection, idempotencyKey, options.actor.id);
-    if (repeated) return repeated;
+    cleanupExpiredIdempotencyRecords(connection, now);
+    const stored = findInvoiceIdempotencyRecord({
+      connection, userId: options.actor.id, keyHash,
+    });
+    if (stored && stored.expiresAt <= now) {
+      deleteInvoiceIdempotencyRecord(connection, stored.id);
+    } else if (stored) {
+      if (stored.requestFingerprint !== requestFingerprint) throw idempotencyKeyReusedError();
+      if (stored.responseStatus !== 201n) throw new Error("Invalid stored idempotency response status.");
+      return readStoredDraftCreationReplay(stored.responseJson);
+    }
     const settings = settingsRow(connection, now);
     const dates = validateDates(request.invoice, dateInTimezone(at, settings.timezone), settings.timezone, at, options.actor.role);
     const beneficiary = prepareBeneficiary(connection, request.invoice.beneficiary);
@@ -417,16 +436,28 @@ export function createInvoiceDraft(options: { input: unknown; actor: DraftActor;
       actorUserId: options.actor.id, actorDisplayName: options.actor.displayName, invoiceId: id,
       invoiceNumber: reserved.invoiceNumber, entityType: "INVOICE", entityId: id,
       summary: getMessages().audit.invoiceCreated, changes: {
-        invoiceStatus: { before: null, after: "DRAFT" }, createIdempotencyKey: idempotencyKey,
-        createReplay: { version: 1, result },
+        invoiceStatus: { before: null, after: "DRAFT" },
       },
       createdAt: now, requestId: options.requestId });
     options.faultInjector?.("afterAudit");
+    insertInvoiceIdempotencyRecord({
+      connection,
+      userId: options.actor.id,
+      keyHash,
+      requestFingerprint,
+      responseStatus: 201,
+      responseJson: JSON.stringify({ version: 1, result }),
+      createdAt: at,
+    });
+    options.faultInjector?.("afterIdempotency");
     return result;
   });
 }
 
-function readStoredDraftCreationReplay(value: unknown, invoiceId: string): DraftResult {
+function readStoredDraftCreationReplay(responseJson: string): DraftResult {
+  let value: unknown;
+  try { value = JSON.parse(responseJson); }
+  catch { throw new Error("Invalid stored draft creation replay."); }
   if (!value || typeof value !== "object") throw new Error("Invalid stored draft creation replay.");
   const replay = value as { version?: unknown; result?: unknown };
   if (replay.version !== 1 || !replay.result || typeof replay.result !== "object") {
@@ -434,7 +465,7 @@ function readStoredDraftCreationReplay(value: unknown, invoiceId: string): Draft
   }
   const result = replay.result as Partial<DraftResult>;
   const invoice = result.invoice as Partial<InvoiceDraftDto> | undefined;
-  if (invoice?.id !== invoiceId || typeof invoice.invoiceNumber !== "string" ||
+  if (typeof invoice?.id !== "string" || typeof invoice.invoiceNumber !== "string" ||
       !Number.isInteger(invoice.rowVersion) || !Array.isArray(invoice.items) ||
       !invoice.totals || typeof invoice.totals !== "object" ||
       !Array.isArray(result.warnings) ||
@@ -442,35 +473,6 @@ function readStoredDraftCreationReplay(value: unknown, invoiceId: string): Draft
     throw new Error("Invalid stored draft creation replay.");
   }
   return result as DraftResult;
-}
-
-function previousDraftCreationRequest(
-  connection: DatabaseConnection,
-  idempotencyKey: string,
-  actorId: string,
-): DraftResult | null {
-  const rows = connection.client.prepare(`select invoice_id as invoiceId,
-      changes_json as changesJson from audit_logs where actor_user_id=? and event_type='INVOICE_CREATED'
-      and invoice_id is not null order by created_at,id`).all(actorId) as Array<{
-        invoiceId: string;
-        changesJson: string | null;
-      }>;
-  for (const row of rows) {
-    let changes: {
-      invoiceStatus?: { after?: unknown };
-      createIdempotencyKey?: unknown;
-      createReplay?: unknown;
-    } | null;
-    try {
-      changes = row.changesJson ? JSON.parse(row.changesJson) as typeof changes : null;
-    } catch {
-      continue;
-    }
-    if (changes?.invoiceStatus?.after !== "DRAFT") continue;
-    if (changes.createIdempotencyKey !== idempotencyKey) continue;
-    return readStoredDraftCreationReplay(changes.createReplay, row.invoiceId);
-  }
-  return null;
 }
 
 export function updateInvoiceDraft(options: { id: string; input: unknown; actor: DraftActor; requestId: string;

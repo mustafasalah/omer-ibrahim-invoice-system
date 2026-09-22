@@ -6,6 +6,8 @@ type WriterData = {
   databasePath: string;
   actor: { id: string; displayName: string; role: "ADMIN" | "EMPLOYEE" };
   requestId: string;
+  idempotencyKey?: string;
+  input?: unknown;
   now: string;
   startGate: SharedArrayBuffer;
   releaseGate?: SharedArrayBuffer;
@@ -33,16 +35,18 @@ try {
     connection,
     actor: data.actor,
     requestId: data.requestId,
-    idempotencyKey: data.requestId,
+    idempotencyKey: data.idempotencyKey ?? data.requestId,
     now: new Date(data.now),
-    input: { intent: "SAVE_DRAFT", invoice: { items: [] } },
+    input: data.input ?? { intent: "SAVE_DRAFT", invoice: { items: [] } },
     faultInjector: (point) => {
       if (point !== "afterSequence" || !data.releaseGate) return;
       port.postMessage({ type: "LOCK_ACQUIRED" });
       waitForSignal(data.releaseGate);
     },
   });
-  port.postMessage({ type: "RESULT", invoiceNumber: result.invoice.invoiceNumber });
+  port.postMessage({ type: "RESULT", invoiceId: result.invoice.id,
+    invoiceNumber: result.invoice.invoiceNumber, rowVersion: result.invoice.rowVersion,
+    warnings: result.warnings });
 } catch (error) {
   const safe = error as { code?: string; status?: number };
   port.postMessage({ type: "ERROR", code: safe.code ?? "UNKNOWN", status: safe.status ?? 500 });

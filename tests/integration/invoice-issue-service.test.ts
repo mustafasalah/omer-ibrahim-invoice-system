@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { withImmediateTransaction } from "@/server/db/transaction";
 import { capturePrintSnapshot } from "@/server/invoices/print-snapshot";
 import {
-  createInvoiceDraft, createIssuedInvoice, getInvoiceDraft, issueInvoiceDraft, updateInvoiceDraft,
+  createInvoiceDraft as createInvoiceDraftService, createIssuedInvoice, getInvoiceDraft, issueInvoiceDraft,
+  updateInvoiceDraft,
   type InvoiceFaultPoint,
 } from "@/server/invoices/service";
 import { apiErrorCodes } from "@/server/http/errors";
@@ -11,6 +12,11 @@ import { createTestAdmin } from "../fixtures/auth";
 import { createTemporaryDatabase, type TemporaryDatabase } from "../fixtures/database";
 
 let temporary: TemporaryDatabase | undefined;
+
+type CreateDraftOptions = Parameters<typeof createInvoiceDraftService>[0];
+function createInvoiceDraft(options: Omit<CreateDraftOptions, "idempotencyKey">) {
+  return createInvoiceDraftService({ ...options, idempotencyKey: `test-issue-${options.requestId}` });
+}
 afterEach(() => { temporary?.dispose(); temporary = undefined; });
 
 const now = new Date("2026-08-27T10:11:12.345Z");

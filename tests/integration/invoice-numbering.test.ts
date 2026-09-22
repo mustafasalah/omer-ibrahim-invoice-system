@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Worker } from "node:worker_threads";
-import { createInvoiceDraft } from "@/server/invoices/service";
+import { createInvoiceDraft as createInvoiceDraftService } from "@/server/invoices/service";
 import { getSettings } from "@/server/settings/service";
 import { createTestAdmin } from "../fixtures/auth";
 import { createTemporaryDatabase, type TemporaryDatabase } from "../fixtures/database";
@@ -10,9 +10,22 @@ afterEach(() => { temporary?.dispose(); temporary = undefined; });
 const emptyDraft = { intent: "SAVE_DRAFT", invoice: { items: [] } };
 const SAFETY_TIMEOUT_MS = 10_000;
 
+type CreateDraftOptions = Parameters<typeof createInvoiceDraftService>[0];
+function createInvoiceDraft(options: Omit<CreateDraftOptions, "idempotencyKey"> & {
+  idempotencyKey?: string;
+}) {
+  return createInvoiceDraftService({
+    ...options,
+    idempotencyKey: options.idempotencyKey ?? `test-number-${options.requestId}`,
+  });
+}
+
 type WriterMessage = {
   type: "READY" | "LOCK_ACQUIRED" | "WRITE_ATTEMPT_STARTED" | "RESULT" | "ERROR";
+  invoiceId?: string;
   invoiceNumber?: string;
+  rowVersion?: number;
+  warnings?: Array<{ code: "FUTURE_INVOICE_DATE" }>;
   code?: string;
   status?: number;
 };
@@ -21,6 +34,8 @@ type WriterData = {
   databasePath: string;
   actor: { id: string; displayName: string; role: "ADMIN" | "EMPLOYEE" };
   requestId: string;
+  idempotencyKey?: string;
+  input?: unknown;
   now: string;
   startGate: SharedArrayBuffer;
   releaseGate?: SharedArrayBuffer;
@@ -140,6 +155,41 @@ describe("invoice number allocation", () => {
       })());
       expect((temporary.connection.client.prepare("select count(distinct invoice_number) as count from invoices").get() as { count: bigint }).count).toBe(2n);
       expect((temporary.connection.client.prepare("select last_value as value from invoice_sequences where sequence_key='invoice:2026'").get() as { value: bigint }).value).toBe(2n);
+    } finally {
+      await closeWriters([first, second], [startGate]);
+    }
+  }, 15_000);
+
+  it("deduplicates two simultaneous writers using the same idempotency key", async () => {
+    temporary = createTemporaryDatabase(); const admin = await createTestAdmin(temporary.connection);
+    const startGate = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+    const input = { intent: "SAVE_DRAFT", invoice: { invoiceDate: "2026-06-02", items: [] } };
+    const base = { databasePath: temporary.connection.databasePath,
+      actor: { id: admin.id, displayName: admin.displayName, role: admin.role },
+      idempotencyKey: "simultaneous-replay-key-001", input,
+      now: "2026-06-01T00:00:00Z", startGate };
+    const first = startWriter({ ...base, requestId: "same-key-request-a" });
+    const second = startWriter({ ...base, requestId: "same-key-request-b" });
+    try {
+      await withSafetyTimeout((async () => {
+        await Promise.all([first.waitFor("READY"), second.waitFor("READY")]);
+        signal(startGate);
+        await Promise.all([first.waitFor("WRITE_ATTEMPT_STARTED"), second.waitFor("WRITE_ATTEMPT_STARTED")]);
+        const outcomes = await Promise.all([first.outcome(), second.outcome()]);
+        expect(outcomes[0]).toMatchObject({ type: "RESULT", invoiceNumber: "OI-2026-00001",
+          rowVersion: 1, warnings: [{ code: "FUTURE_INVOICE_DATE" }] });
+        expect(outcomes[1]).toEqual(outcomes[0]);
+        await Promise.all([first.exited, second.exited]);
+      })());
+      for (const table of ["invoices", "invoice_idempotency_records"]) {
+        expect((temporary.connection.client.prepare(`select count(*) as count from ${table}`).get() as {
+          count: bigint;
+        }).count, table).toBe(1n);
+      }
+      expect((temporary.connection.client.prepare(`select count(*) as count from audit_logs
+        where event_type='INVOICE_CREATED'`).get() as { count: bigint }).count).toBe(1n);
+      expect((temporary.connection.client.prepare(`select last_value as value from invoice_sequences
+        where sequence_key='invoice:2026'`).get() as { value: bigint }).value).toBe(1n);
     } finally {
       await closeWriters([first, second], [startGate]);
     }
