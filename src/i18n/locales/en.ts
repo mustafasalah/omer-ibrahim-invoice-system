@@ -312,6 +312,7 @@ export const enMessages = {
     internal: "The request could not be completed.",
     serviceUnavailable: "The local service is not ready.",
     validation: "Check the submitted data.",
+    invalidIdempotencyKey: "The draft save key is missing or invalid.",
     conflict: "The operation conflicts with a newer change.",
     databaseBusy: "The database is temporarily busy. Try again.",
     notFound: "The requested item was not found.",

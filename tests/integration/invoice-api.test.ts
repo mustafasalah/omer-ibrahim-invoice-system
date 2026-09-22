@@ -3,6 +3,7 @@ import { GET as getCsrf } from "@/app/api/auth/csrf/route";
 import { POST } from "@/app/api/invoices/route";
 import { GET, PATCH } from "@/app/api/invoices/[id]/route";
 import { POST as ISSUE } from "@/app/api/invoices/[id]/issue/route";
+import type { DraftResult } from "@/domain/invoices/draft";
 import { createSessionToken, insertSession } from "@/server/auth/sessions";
 import { apiErrorCodes } from "@/server/http/errors";
 import { createTestAdmin } from "../fixtures/auth";
@@ -25,10 +26,12 @@ async function csrf() {
 }
 
 function request(url: string, method: "POST" | "PATCH", body: unknown, authCookie: string, token: string,
-  csrfCookie: string, requestId = "invoice-api-test", idempotencyKey = "invoice-api-test-key") {
-  return new Request(url, { method, headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000",
+  csrfCookie: string, requestId = "invoice-api-test", idempotencyKey: string | null = "invoice-api-test-key") {
+  const headers = new Headers({ host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000",
     "sec-fetch-site": "same-origin", "content-type": "application/json", cookie: `${authCookie}; ${csrfCookie}`,
-    "x-csrf-token": token, "x-request-id": requestId, "idempotency-key": idempotencyKey },
+    "x-csrf-token": token, "x-request-id": requestId });
+  if (idempotencyKey !== null) headers.set("idempotency-key", idempotencyKey);
+  return new Request(url, { method, headers,
   body: JSON.stringify(body) });
 }
 
@@ -57,6 +60,40 @@ describe("invoice draft API", () => {
         requestId: "invoice-api-test" } });
     }
     expect((temporary.connection.client.prepare("select count(*) as count from invoice_sequences").get() as { count: bigint }).count).toBe(0n);
+  });
+
+  it("requires a valid Idempotency-Key for SAVE_DRAFT without reserving data for invalid keys", async () => {
+    temporary = createTemporaryDatabase(); globalThis.__oimsDatabaseConnection = temporary.connection;
+    const admin = await createTestAdmin(temporary.connection); const token = createSessionToken();
+    insertSession({ connection: temporary.connection, user: admin, token, now: new Date() });
+    const csrfData = await csrf(); const authCookie = `oims_session=${token}`;
+    const invalidKeys: Array<[string, string | null]> = [
+      ["missing", null],
+      ["empty", ""],
+      ["too-long", `a${"b".repeat(128)}`],
+      ["malformed", "draft/key-with-slash"],
+    ];
+    for (const [label, key] of invalidKeys) {
+      const response = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+        intent: "SAVE_DRAFT", invoice: { items: [] },
+      }, authCookie, csrfData.token, csrfData.cookie, `invalid-key-${label}`, key));
+      expect(response.status).toBe(422);
+      await expect(response.json()).resolves.toMatchObject({ error: {
+        code: apiErrorCodes.INVALID_IDEMPOTENCY_KEY,
+        fieldErrors: { idempotencyKey: "INVALID_IDEMPOTENCY_KEY" },
+        requestId: `invalid-key-${label}`,
+      } });
+    }
+    expect((temporary.connection.client.prepare("select count(*) as count from invoices").get() as { count: bigint }).count).toBe(0n);
+    expect((temporary.connection.client.prepare("select count(*) as count from invoice_sequences").get() as { count: bigint }).count).toBe(0n);
+    expect((temporary.connection.client.prepare("select count(*) as count from audit_logs where event_type='INVOICE_CREATED'")
+      .get() as { count: bigint }).count).toBe(0n);
+
+    const valid = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+      intent: "SAVE_DRAFT", invoice: { items: [] },
+    }, authCookie, csrfData.token, csrfData.cookie, "valid-key-request", "valid-draft-key-0001"));
+    expect(valid.status).toBe(201);
+    expect((temporary.connection.client.prepare("select count(*) as count from invoices").get() as { count: bigint }).count).toBe(1n);
   });
 
   it("ignores forged calculated fields and persists server-recalculated values (AT-CALC-010)", async () => {
@@ -98,7 +135,7 @@ describe("invoice draft API", () => {
         items: [{ clientKey: "one", productName: "منتج", quantity: "2", unitPrice: "5" }] },
     }, authCookie, csrfData.token, csrfData.cookie));
     expect(createdResponse.status).toBe(201);
-    const created = await createdResponse.json() as { invoice: { id: string; rowVersion: number }; requestId: string };
+    const created = await createdResponse.json() as DraftResult & { requestId: string };
     expect(created.requestId).toBe("invoice-api-test");
     const lostResponseRetry = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
       intent: "SAVE_DRAFT", invoice: { notes: "a retry must return the committed operation", items: [] },
@@ -118,6 +155,15 @@ describe("invoice draft API", () => {
     }, authCookie, csrfData.token, csrfData.cookie));
     expect(patchedResponse.status).toBe(200);
     await expect(patchedResponse.json()).resolves.toMatchObject({ invoice: { notes: "معدلة", rowVersion: 2, items: [] } });
+    const immutableRetryResponse = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+      intent: "SAVE_DRAFT", invoice: { notes: "a later retry body must be ignored", items: [] },
+    }, authCookie, csrfData.token, csrfData.cookie, "invoice-api-retry-after-edit", "invoice-api-test-key"));
+    expect(immutableRetryResponse.status).toBe(201);
+    const immutableRetry = await immutableRetryResponse.json() as DraftResult & { requestId: string };
+    expect(immutableRetry.requestId).toBe("invoice-api-retry-after-edit");
+    expect({ ...immutableRetry, requestId: created.requestId }).toEqual(created);
+    expect((temporary.connection.client.prepare("select count(*) as count from audit_logs where event_type='INVOICE_CREATED'")
+      .get() as { count: bigint }).count).toBe(1n);
     const stale = await PATCH(request(`http://127.0.0.1:3000/api/invoices/${created.invoice.id}`, "PATCH", {
       rowVersion: 1, invoice: { items: [] },
     }, authCookie, csrfData.token, csrfData.cookie));
@@ -175,7 +221,7 @@ describe("invoice draft API", () => {
     const draftResponse = await POST(new Request("http://127.0.0.1:3000/api/invoices", {
       method: "POST", headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000",
         "sec-fetch-site": "same-origin", "content-type": "application/json", cookie: `${authCookie}; ${csrfData.cookie}`,
-        "x-csrf-token": csrfData.token, "x-request-id": "draft-api-create" },
+        "x-csrf-token": csrfData.token, "x-request-id": "draft-api-create", "idempotency-key": "draft-api-create-key" },
       body: JSON.stringify({ intent: "SAVE_DRAFT", invoice: {} }),
     }));
     const draftCreated = await draftResponse.json() as { invoice: { id: string; rowVersion: number } };

@@ -307,6 +307,7 @@ export const arMessages = {
     invoiceIssued: "إصدار فاتورة",
   },
   errors: {
+    invalidIdempotencyKey: "مفتاح حفظ المسودة مفقود أو غير صالح.",
     internal: "تعذر إكمال الطلب.",
     serviceUnavailable: "الخدمة المحلية غير جاهزة.",
     validation: "تحقق من البيانات المدخلة.",

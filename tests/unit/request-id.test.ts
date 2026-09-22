@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { getRequestId } from "@/server/http/request-id";
-import { getIdempotencyKey } from "@/server/http/idempotency";
+import { requireIdempotencyKey } from "@/server/http/idempotency";
 
 describe("request IDs", () => {
   it("keeps a safe incoming ID", () => {
@@ -21,12 +21,22 @@ describe("request IDs", () => {
 });
 
 describe("idempotency keys", () => {
-  it("keeps a stable explicit key and safely falls back to the request ID", () => {
-    expect(getIdempotencyKey(new Request("http://localhost/api/invoices", {
+  it("accepts an explicit key within the documented character and length limits", () => {
+    expect(requireIdempotencyKey(new Request("http://localhost/api/invoices", {
       headers: { "idempotency-key": "draft-create-key-123" },
-    }), "fallback-request")).toBe("draft-create-key-123");
-    expect(getIdempotencyKey(new Request("http://localhost/api/invoices", {
-      headers: { "idempotency-key": "short" },
-    }), "fallback-request")).toBe("fallback-request");
+    }))).toBe("draft-create-key-123");
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["empty", ""],
+    ["too short", "short"],
+    ["too long", `a${"b".repeat(128)}`],
+    ["malformed", "draft key contains spaces"],
+  ])("rejects a %s key without falling back to the request ID", (_label, key) => {
+    const headers = new Headers();
+    if (key !== undefined) headers.set("idempotency-key", key);
+    expect(() => requireIdempotencyKey(new Request("http://localhost/api/invoices", { headers })))
+      .toThrowError(expect.objectContaining({ code: "INVALID_IDEMPOTENCY_KEY", status: 422 }));
   });
 });

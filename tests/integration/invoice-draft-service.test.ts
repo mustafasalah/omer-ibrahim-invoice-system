@@ -23,16 +23,26 @@ async function setup() {
 describe("atomic invoice draft persistence", () => {
   it("deduplicates a lost create response by actor and operation without reserving another number", async () => {
     const { connection, actor } = await setup();
-    const first = createInvoiceDraft({ connection, actor, input: draft(), requestId: "lost-create-response", now });
+    const first = createInvoiceDraft({ connection, actor, input: draft({ invoiceDate: "2026-08-28" }),
+      requestId: "lost-create-response", idempotencyKey: "lost-create-operation-001", now });
+    const updated = updateInvoiceDraft({ connection, actor, id: first.invoice.id, requestId: "later-update", now,
+      input: { rowVersion: first.invoice.rowVersion, invoice: { notes: "a later committed edit", items: [] } } });
+    expect(updated.invoice.rowVersion).toBe(2);
     const retried = createInvoiceDraft({ connection, actor,
-      input: draft({ notes: "must not replace the completed operation" }), requestId: "lost-create-response", now });
-    expect(retried.invoice.id).toBe(first.invoice.id);
-    expect(retried.invoice.invoiceNumber).toBe(first.invoice.invoiceNumber);
+      input: draft({ notes: "must not replace the completed operation" }), requestId: "retry-http-request",
+      idempotencyKey: "lost-create-operation-001", now });
+    expect(retried).toEqual(first);
+    expect(retried.invoice.rowVersion).toBe(1);
     expect(retried.invoice.notes).toBe(first.invoice.notes);
+    expect(retried.warnings).toEqual([{ code: "FUTURE_INVOICE_DATE" }]);
     expect((connection.client.prepare("select count(*) as count from invoices").get() as { count: bigint }).count).toBe(1n);
     expect((connection.client.prepare("select last_value as value from invoice_sequences where sequence_key='invoice:2026'").get() as { value: bigint }).value).toBe(1n);
-    expect((connection.client.prepare("select count(*) as count from audit_logs where request_id=? and event_type='INVOICE_CREATED'")
-      .get("lost-create-response") as { count: bigint }).count).toBe(1n);
+    expect((connection.client.prepare("select count(*) as count from audit_logs where event_type='INVOICE_CREATED'")
+      .get() as { count: bigint }).count).toBe(1n);
+    const storedReplay = (connection.client.prepare("select changes_json as changesJson from audit_logs where event_type='INVOICE_CREATED'")
+      .get() as { changesJson: string }).changesJson;
+    expect(JSON.parse(storedReplay)).toMatchObject({ createReplay: { version: 1, result: first } });
+    expect(storedReplay).not.toMatch(/password|session|cookie|csrf|token|hash/iu);
   });
 
   it("covers AT-LIFE-001 and AT-NUM-002 by saving incomplete drafts with server totals and sequential numbers", async () => {

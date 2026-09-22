@@ -10,6 +10,7 @@ export const apiErrorCodes = {
   DATABASE_BUSY: "DATABASE_BUSY",
   FORBIDDEN: "FORBIDDEN",
   INTERNAL_ERROR: "INTERNAL_ERROR",
+  INVALID_IDEMPOTENCY_KEY: "INVALID_IDEMPOTENCY_KEY",
   INVALID_CREDENTIALS: "INVALID_CREDENTIALS",
   LOGIN_RATE_LIMITED: "LOGIN_RATE_LIMITED",
   NOT_FOUND: "NOT_FOUND",
@@ -114,6 +115,15 @@ export function validationError(fieldErrors?: Record<string, string>): AppError 
     message: getMessages().errors.validation,
     status: 422,
     fieldErrors,
+  });
+}
+
+export function invalidIdempotencyKeyError(): AppError {
+  return new AppError({
+    code: apiErrorCodes.INVALID_IDEMPOTENCY_KEY,
+    message: getMessages().errors.invalidIdempotencyKey,
+    status: 422,
+    fieldErrors: { idempotencyKey: "INVALID_IDEMPOTENCY_KEY" },
   });
 }
 
