@@ -37,6 +37,20 @@ describe("invoice draft contracts", () => {
     ]) expect(() => parseCreateDraft(input)).toThrow(DraftValidationError);
   });
 
+  it("returns stable invoice validation codes without exposing raw Zod messages", () => {
+    try {
+      parseCreateDraft({ intent: "SAVE_DRAFT", invoice: { unknownField: true, notes: "x".repeat(2_001) } });
+      throw new Error("Expected validation to fail.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(DraftValidationError);
+      expect((error as DraftValidationError).fieldErrors).toMatchObject({
+        "invoice.unknownField": "UNKNOWN_FIELD",
+        "invoice.notes": "TEXT_TOO_LONG",
+      });
+      expect(JSON.stringify((error as DraftValidationError).fieldErrors)).not.toMatch(/unrecognized|expected|received/iu);
+    }
+  });
+
   it("canonicalizes valid decimals and links field errors to item indexes and client keys", () => {
     const parsed = parseUpdateDraft({ rowVersion: 1, invoice: { items: [
       { clientKey: "good", productName: "  قفاز  ", quantity: "01.500", unitPrice: "0.00" },

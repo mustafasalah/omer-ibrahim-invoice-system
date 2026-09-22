@@ -21,6 +21,20 @@ async function setup() {
 }
 
 describe("atomic invoice draft persistence", () => {
+  it("deduplicates a lost create response by actor and operation without reserving another number", async () => {
+    const { connection, actor } = await setup();
+    const first = createInvoiceDraft({ connection, actor, input: draft(), requestId: "lost-create-response", now });
+    const retried = createInvoiceDraft({ connection, actor,
+      input: draft({ notes: "must not replace the completed operation" }), requestId: "lost-create-response", now });
+    expect(retried.invoice.id).toBe(first.invoice.id);
+    expect(retried.invoice.invoiceNumber).toBe(first.invoice.invoiceNumber);
+    expect(retried.invoice.notes).toBe(first.invoice.notes);
+    expect((connection.client.prepare("select count(*) as count from invoices").get() as { count: bigint }).count).toBe(1n);
+    expect((connection.client.prepare("select last_value as value from invoice_sequences where sequence_key='invoice:2026'").get() as { value: bigint }).value).toBe(1n);
+    expect((connection.client.prepare("select count(*) as count from audit_logs where request_id=? and event_type='INVOICE_CREATED'")
+      .get("lost-create-response") as { count: bigint }).count).toBe(1n);
+  });
+
   it("covers AT-LIFE-001 and AT-NUM-002 by saving incomplete drafts with server totals and sequential numbers", async () => {
     const { connection, actor } = await setup();
     connection.client.prepare("insert into invoice_sequences (sequence_key,last_value,updated_at) values (?,?,?)")

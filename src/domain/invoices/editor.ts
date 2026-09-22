@@ -203,6 +203,34 @@ export function editorDraftFingerprint(state: InvoiceEditorState): string {
   return JSON.stringify(toDraftInput(state));
 }
 
+export function reconcileSavedInvoice(
+  current: InvoiceEditorState,
+  saved: InvoiceDraftDto,
+  requestFingerprint: string,
+): { state: InvoiceEditorState; baseline: string; changedDuringRequest: boolean } {
+  const persisted = stateFromInvoice(saved);
+  const baseline = editorDraftFingerprint(persisted);
+  if (editorDraftFingerprint(current) === requestFingerprint) {
+    return { state: persisted, baseline, changedDuringRequest: false };
+  }
+  return {
+    state: {
+      ...current,
+      id: persisted.id,
+      invoiceNumber: persisted.invoiceNumber,
+      invoiceStatus: persisted.invoiceStatus,
+      isArchived: persisted.isArchived,
+      currency: persisted.currency,
+      rowVersion: persisted.rowVersion,
+      createdBy: persisted.createdBy,
+      updatedBy: persisted.updatedBy,
+      serverPreview: null,
+    },
+    baseline,
+    changedDuringRequest: true,
+  };
+}
+
 export function parseInvoiceResponse(value: unknown): InvoiceDraftDto | null {
   const parsed = invoiceDtoSchema.safeParse(value);
   return parsed.success ? parsed.data : null;

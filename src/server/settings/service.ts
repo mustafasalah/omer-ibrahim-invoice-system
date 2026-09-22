@@ -4,6 +4,7 @@ import type { EditableSettings, InvoiceNumberPreview, SettingsDto } from "@/doma
 import { SESSION_ABSOLUTE_HOURS, SETTINGS_ID } from "@/domain/settings/contracts";
 import { formatInvoiceNumber, InvoiceNumberPatternError } from "@/domain/settings/numbering";
 import { parseSettingsPatch, SettingsValidationError, type SettingsPatchInput } from "@/domain/settings/validation";
+import { validationErrorCodes } from "@/domain/validation/codes";
 import { getMessages } from "@/i18n";
 import { appendAuditEvent, type AuditEvent } from "@/server/audit/service";
 import { getDatabase, type DatabaseConnection } from "@/server/db/connection";
@@ -55,6 +56,15 @@ function rowToDto(row: SettingsRow): SettingsDto {
     defaultPaymentTerms: row.defaultPaymentTerms, footerText: row.footerText,
     rowVersion: Number(row.rowVersion), updatedAt: row.updatedAt,
   };
+}
+
+export function getRegionalDisplaySettings(options: { connection?: DatabaseConnection } = {}): {
+  dateDisplayFormat: SettingsDto["regional"]["dateDisplayFormat"];
+  timezone: string;
+} {
+  const row = readRow(options.connection ?? getDatabase());
+  if (!row) throw new Error("Settings are unavailable.");
+  return { dateDisplayFormat: row.dateDisplayFormat, timezone: row.timezone };
 }
 
 function editable(settings: SettingsDto): EditableSettings {
@@ -116,13 +126,17 @@ export function updateSettings(options: { input: unknown; actor: { id: string; d
     try { preview = previewFor(connection, input.settings, at); }
     catch (error) {
       if (error instanceof InvoiceNumberPatternError || error instanceof RangeError) {
-        throw validationError({ "settings.numbering.pattern": "The next invoice number cannot be generated." });
+        throw validationError({
+          "settings.numbering.pattern": validationErrorCodes.NEXT_INVOICE_NUMBER_UNAVAILABLE,
+        });
       }
       throw error;
     }
     const collision = connection.client.prepare("select 1 as found from invoices where invoice_number = ? limit 1")
       .get(preview.invoiceNumber) as { found: bigint } | undefined;
-    if (collision) throw validationError({ "settings.numbering.pattern": "The preview collides with an existing invoice number." });
+    if (collision) throw validationError({
+      "settings.numbering.pattern": validationErrorCodes.INVOICE_NUMBER_COLLISION,
+    });
     if (Object.keys(changes).length === 0) return { settings: rowToDto(row), preview };
     connection.client.prepare(`update app_settings set company_name_ar=?, company_name_en=?, address=?,
       phones_json=?, email=?, registration_number=?, currency_code=?, currency_symbol_ar=?, currency_decimals=?,

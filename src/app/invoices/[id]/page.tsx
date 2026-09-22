@@ -6,7 +6,7 @@ import {
   formatStoredMoney,
   formatStoredQuantity,
   formatStoredUnitPrice,
-  formatUtcTimestamp,
+  formatTimestampInTimezone,
   invoiceStatusKey,
   paymentStatusKey,
 } from "@/domain/invoices/details";
@@ -16,6 +16,7 @@ import type { MessageShape } from "@/i18n/types";
 import { optionalPageSession } from "@/server/auth/page-session";
 import { AppError } from "@/server/http/errors";
 import { getInvoiceDraft } from "@/server/invoices/service";
+import { getRegionalDisplaySettings } from "@/server/settings/service";
 
 export const dynamic = "force-dynamic";
 
@@ -95,7 +96,11 @@ export default async function InvoiceDetailsPage({ params }: { params: Promise<{
   const invoiceStatus = invoiceStatusKey(invoice.invoiceStatus);
   const paymentStatus = paymentStatusKey(invoice.paymentStatus);
   const money = (value: string) => formatStoredMoney(value, invoice.currency);
-  const timestamp = (value: string) => `${formatUtcTimestamp(value)} ${messages.utc}`;
+  const regional = getRegionalDisplaySettings();
+  const timestamp = (value: string) => formatTimestampInTimezone(
+    value, regional.timezone, regional.dateDisplayFormat,
+  );
+  const calendarDate = (value: string) => formatCalendarDate(value, regional.dateDisplayFormat);
 
   return <main className="invoice-details-page" id="main-content" data-invoice-status={invoice.invoiceStatus}>
     <nav className="invoice-breadcrumb" aria-label={messages.breadcrumb}>
@@ -172,9 +177,9 @@ export default async function InvoiceDetailsPage({ params }: { params: Promise<{
       <aside className="invoice-detail-section invoice-detail-metadata" aria-labelledby="metadata-title">
         <h2 id="metadata-title">{messages.metadata}</h2>
         <dl>
-          <div><dt>{messages.invoiceDate}</dt><dd><time dir="ltr" dateTime={invoice.invoiceDate}>{formatCalendarDate(invoice.invoiceDate)}</time></dd></div>
+          <div><dt>{messages.invoiceDate}</dt><dd><time dir="ltr" dateTime={invoice.invoiceDate}>{calendarDate(invoice.invoiceDate)}</time></dd></div>
           <div><dt>{messages.dueDate}</dt><dd>{invoice.dueDate
-            ? <time dir="ltr" dateTime={invoice.dueDate}>{formatCalendarDate(invoice.dueDate)}</time>
+            ? <time dir="ltr" dateTime={invoice.dueDate}>{calendarDate(invoice.dueDate)}</time>
             : <span className="invoice-detail-empty">—</span>}</dd></div>
           <div><dt>{messages.currencySnapshot}</dt><dd><bdi dir="ltr">{invoice.currency.code} · {invoice.currency.symbol} · {invoice.currency.decimals}</bdi></dd></div>
           <div><dt>{messages.createdBy}</dt><dd>{invoice.createdBy.displayName}</dd></div>

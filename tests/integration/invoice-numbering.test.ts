@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { openDatabase } from "@/server/db/connection";
+import { fork, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createInvoiceDraft } from "@/server/invoices/service";
 import { getSettings } from "@/server/settings/service";
 import { createTestAdmin } from "../fixtures/auth";
@@ -8,6 +9,33 @@ import { createTemporaryDatabase, type TemporaryDatabase } from "../fixtures/dat
 let temporary: TemporaryDatabase | undefined;
 afterEach(() => { temporary?.dispose(); temporary = undefined; });
 const emptyDraft = { intent: "SAVE_DRAFT", invoice: { items: [] } };
+
+type WriterMessage = { type: "ready" | "lock-held" | "result" | "error"; invoiceNumber?: string; code?: string; status?: number };
+
+function startWriter(workerData: Record<string, unknown>) {
+  const worker: ChildProcess = fork(fileURLToPath(new URL("../fixtures/typescript-process-bootstrap.mjs", import.meta.url)), [], {
+    execArgv: ["--conditions=react-server"],
+    stdio: ["ignore", "ignore", "inherit", "ipc"],
+  });
+  const messages: WriterMessage[] = [];
+  const waiters = new Map<string, Array<(message: WriterMessage) => void>>();
+  worker.on("message", (message: WriterMessage) => {
+    messages.push(message);
+    waiters.get(message.type)?.splice(0).forEach((resolve) => resolve(message));
+  });
+  const waitFor = (type: WriterMessage["type"]): Promise<WriterMessage> => {
+    const existing = messages.find((message) => message.type === type);
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error(`Timed out waiting for worker message: ${type}`)), 8_000);
+      const wrapped = (message: WriterMessage) => { clearTimeout(timeout); resolve(message); };
+      waiters.set(type, [...(waiters.get(type) ?? []), wrapped]);
+      worker.once("error", reject);
+    });
+  };
+  const outcome = () => Promise.race([waitFor("result"), waitFor("error")]);
+  return { worker, waitFor, outcome, start: () => worker.send({ type: "run", data: workerData }) };
+}
 
 describe("invoice number allocation", () => {
   it("uses max(last + 1, sequence start) and skips colliding final numbers", async () => {
@@ -46,18 +74,40 @@ describe("invoice number allocation", () => {
 
   it("serializes two creation attempts from independent connections into unique sequential numbers", async () => {
     temporary = createTemporaryDatabase(); const admin = await createTestAdmin(temporary.connection);
-    const secondConnection = openDatabase(temporary.connection.databasePath);
+    const workerData = { databasePath: temporary.connection.databasePath,
+      actor: { id: admin.id, displayName: admin.displayName, role: admin.role },
+      now: "2026-06-01T00:00:00Z" };
+    const first = startWriter({ ...workerData, requestId: "concurrent-a" });
+    const second = startWriter({ ...workerData, requestId: "concurrent-b" });
     try {
-      const primaryConnection = temporary.connection;
-      const [first, second] = await Promise.all([
-        Promise.resolve().then(() => createInvoiceDraft({ connection: primaryConnection, actor: admin,
-          input: emptyDraft, requestId: "concurrent-a", now: new Date("2026-06-01T00:00:00Z") })),
-        Promise.resolve().then(() => createInvoiceDraft({ connection: secondConnection, actor: admin,
-          input: emptyDraft, requestId: "concurrent-b", now: new Date("2026-06-01T00:00:00Z") })),
-      ]);
-      expect([first.invoice.invoiceNumber, second.invoice.invoiceNumber].sort())
+      await Promise.all([first.waitFor("ready"), second.waitFor("ready")]);
+      first.start(); second.start();
+      const outcomes = await Promise.all([first.outcome(), second.outcome()]);
+      expect(outcomes.map((message) => message.invoiceNumber).sort())
         .toEqual(["OI-2026-00001", "OI-2026-00002"]);
-      expect((primaryConnection.client.prepare("select count(distinct invoice_number) as count from invoices").get() as { count: bigint }).count).toBe(2n);
-    } finally { secondConnection.client.close(); }
-  });
+      expect((temporary.connection.client.prepare("select count(distinct invoice_number) as count from invoices").get() as { count: bigint }).count).toBe(2n);
+      expect((temporary.connection.client.prepare("select last_value as value from invoice_sequences where sequence_key='invoice:2026'").get() as { value: bigint }).value).toBe(2n);
+    } finally { first.worker.kill(); second.worker.kill(); }
+  }, 15_000);
+
+  it("honors busy timeout deterministically without consuming a sequence number", async () => {
+    temporary = createTemporaryDatabase(); const admin = await createTestAdmin(temporary.connection);
+    const base = { databasePath: temporary.connection.databasePath,
+      actor: { id: admin.id, displayName: admin.displayName, role: admin.role }, now: "2026-06-01T00:00:00Z" };
+    const holder = startWriter({ ...base, requestId: "lock-holder", holdAfterSequenceMs: 4_000 });
+    let contender: ReturnType<typeof startWriter> | undefined;
+    try {
+      await holder.waitFor("ready"); holder.start(); await holder.waitFor("lock-held");
+      contender = startWriter({ ...base, requestId: "lock-contender", busyTimeoutMs: 25 });
+      await contender.waitFor("ready"); contender.start();
+      await expect(contender.outcome()).resolves.toMatchObject({ type: "error", code: "DATABASE_BUSY", status: 503 });
+      await expect(holder.outcome()).resolves.toMatchObject({ type: "result", invoiceNumber: "OI-2026-00001" });
+      const recovered = createInvoiceDraft({ connection: temporary.connection, actor: admin, input: emptyDraft,
+        requestId: "after-lock", now: new Date("2026-06-01T00:00:00Z") });
+      expect(recovered.invoice.invoiceNumber).toBe("OI-2026-00002");
+      expect((temporary.connection.client.prepare("select last_value as value from invoice_sequences where sequence_key='invoice:2026'").get() as { value: bigint }).value).toBe(2n);
+    } finally {
+      holder.worker.kill(); contender?.worker.kill();
+    }
+  }, 15_000);
 });

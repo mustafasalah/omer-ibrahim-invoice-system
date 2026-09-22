@@ -6,7 +6,7 @@ import {
   formatStoredMoney,
   formatStoredQuantity,
   formatStoredUnitPrice,
-  formatUtcTimestamp,
+  formatTimestampInTimezone,
   invoiceStatusKey,
   paymentStatusKey,
 } from "@/domain/invoices/details";
@@ -38,9 +38,15 @@ describe("invoice detail presentation", () => {
     expect(sources).not.toMatch(/\bNumber\s*\(/u);
   });
 
-  it("formats invoice dates and UTC metadata independently of the host timezone", () => {
-    expect(formatCalendarDate("2026-09-10", "en-GB")).toBe("10 Sept 2026");
-    expect(formatUtcTimestamp("2026-09-10T13:45:00.000Z", "en-GB")).toContain("13:45");
-    expect(formatCalendarDate("stored-as-is", "en-GB")).toBe("stored-as-is");
+  it("uses the saved date format and establishment timezone across a UTC year boundary", () => {
+    expect(formatCalendarDate("2026-09-10", "DD/MM/YYYY", "en-GB")).toBe("10/09/2026");
+    expect(formatCalendarDate("2026-09-10", "YYYY-MM-DD", "en-GB")).toBe("2026-09-10");
+    expect(formatTimestampInTimezone(
+      "2026-12-31T22:30:00.000Z", "Africa/Khartoum", "DD/MM/YYYY", "en-GB",
+    )).toBe("01/01/2027 00:30");
+    expect(formatTimestampInTimezone(
+      "2026-12-31T22:30:00.000Z", "UTC", "YYYY-MM-DD", "en-GB",
+    )).toBe("2026-12-31 22:30");
+    expect(formatCalendarDate("stored-as-is", "DD/MM/YYYY", "en-GB")).toBe("stored-as-is");
   });
 });

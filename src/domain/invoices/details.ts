@@ -39,19 +39,46 @@ export function formatStoredUnitPrice(value: string | null, currency: CurrencySn
   return value === null ? null : `${value} ${currency.symbol}`;
 }
 
-export function formatCalendarDate(value: string, locale = "ar-SD"): string {
+export type DateDisplayFormat = "DD/MM/YYYY" | "YYYY-MM-DD";
+
+function dateParts(date: Date, locale: string, timeZone: string): Record<string, string> {
+  return Object.fromEntries(new Intl.DateTimeFormat(locale, {
+    year: "numeric", month: "2-digit", day: "2-digit", timeZone,
+  }).formatToParts(date).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+}
+
+function displayDate(date: Date, format: DateDisplayFormat, locale: string, timeZone: string): string {
+  const parts = dateParts(date, locale, timeZone);
+  return format === "YYYY-MM-DD"
+    ? `${parts.year}-${parts.month}-${parts.day}`
+    : `${parts.day}/${parts.month}/${parts.year}`;
+}
+
+export function formatCalendarDate(
+  value: string,
+  format: DateDisplayFormat = "DD/MM/YYYY",
+  locale = "ar-SD",
+): string {
   if (!/^\d{4}-\d{2}-\d{2}$/u.test(value)) return value;
   const date = new Date(`${value}T00:00:00.000Z`);
   if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeZone: "UTC" }).format(date);
+  return displayDate(date, format, locale, "UTC");
 }
 
-export function formatUtcTimestamp(value: string, locale = "ar-SD"): string {
+export function formatTimestampInTimezone(
+  value: string,
+  timeZone: string,
+  format: DateDisplayFormat = "DD/MM/YYYY",
+  locale = "ar-SD",
+): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat(locale, {
-    dateStyle: "medium",
-    timeStyle: "short",
-    timeZone: "UTC",
-  }).format(date);
+  try {
+    const time = new Intl.DateTimeFormat(locale, {
+      hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZone,
+    }).format(date);
+    return `${displayDate(date, format, locale, timeZone)} ${time}`;
+  } catch {
+    return value;
+  }
 }

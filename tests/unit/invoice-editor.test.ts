@@ -8,9 +8,11 @@ import {
   editorItemHasData,
   emptyEditorItem,
   moveEditorItem,
+  reconcileSavedInvoice,
   removeEditorItem,
   toDraftInput,
 } from "@/domain/invoices/editor";
+import type { InvoiceDraftDto } from "@/domain/invoices/draft";
 
 const defaults = {
   invoiceDate: "2026-09-02",
@@ -86,5 +88,30 @@ describe("invoice draft editor state", () => {
     expect(editorDraftFingerprint(state)).not.toBe(baseline);
     const savedBaseline = editorDraftFingerprint(state);
     expect(editorDraftFingerprint(state)).toBe(savedBaseline);
+  });
+
+  it("binds a create response to its invoice without overwriting edits made while saving", () => {
+    const sent = createEditorState(defaults, "first");
+    sent.notes = "sent";
+    const fingerprint = editorDraftFingerprint(sent);
+    const current = structuredClone(sent);
+    current.notes = "typed while saving";
+    const saved = {
+      id: "01K00000000000000000000000", invoiceNumber: "OI-2026-00001", invoiceStatus: "DRAFT",
+      paymentStatus: "UNPAID", isArchived: false, invoiceDate: defaults.invoiceDate, dueDate: null,
+      beneficiary: { suggestionId: null, name: null, phone: null, address: null, registrationNumber: null },
+      currency: defaults.currency, items: [], notes: "sent", paymentTerms: defaults.paymentTerms,
+      totals: { subtotalMinor: "0", lineDiscountsMinor: "0", invoiceDiscountMinor: "0", discountTotalMinor: "0",
+        taxableTotalMinor: "0", taxTotalMinor: "0", grandTotalMinor: "0", grossPaidMinor: "0",
+        refundedTotalMinor: "0", netCollectedMinor: "0", remainingMinor: "0" },
+      createdAt: "2026-09-02T00:00:00.000Z", updatedAt: "2026-09-02T00:00:00.000Z",
+      createdBy: { id: "admin", displayName: "Admin" }, updatedBy: { id: "admin", displayName: "Admin" },
+      issuedAt: null, issuedBy: null, sourceInvoice: null, printSnapshot: null, rowVersion: 1,
+    } satisfies InvoiceDraftDto;
+    const reconciled = reconcileSavedInvoice(current, saved, fingerprint);
+    expect(reconciled.changedDuringRequest).toBe(true);
+    expect(reconciled.state).toMatchObject({ id: saved.id, invoiceNumber: saved.invoiceNumber,
+      rowVersion: 1, notes: "typed while saving" });
+    expect(reconciled.baseline).not.toBe(editorDraftFingerprint(reconciled.state));
   });
 });

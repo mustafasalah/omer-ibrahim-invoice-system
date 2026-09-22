@@ -24,10 +24,12 @@ async function csrf() {
   return { token: (await response.clone().json() as { csrfToken: string }).csrfToken, cookie: cookiePair(response) };
 }
 
-function request(url: string, method: "POST" | "PATCH", body: unknown, authCookie: string, token: string, csrfCookie: string) {
+function request(url: string, method: "POST" | "PATCH", body: unknown, authCookie: string, token: string,
+  csrfCookie: string, requestId = "invoice-api-test", idempotencyKey = "invoice-api-test-key") {
   return new Request(url, { method, headers: { host: "127.0.0.1:3000", origin: "http://127.0.0.1:3000",
     "sec-fetch-site": "same-origin", "content-type": "application/json", cookie: `${authCookie}; ${csrfCookie}`,
-    "x-csrf-token": token, "x-request-id": "invoice-api-test" }, body: JSON.stringify(body) });
+    "x-csrf-token": token, "x-request-id": requestId, "idempotency-key": idempotencyKey },
+  body: JSON.stringify(body) });
 }
 
 describe("invoice draft API", () => {
@@ -98,6 +100,13 @@ describe("invoice draft API", () => {
     expect(createdResponse.status).toBe(201);
     const created = await createdResponse.json() as { invoice: { id: string; rowVersion: number }; requestId: string };
     expect(created.requestId).toBe("invoice-api-test");
+    const lostResponseRetry = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+      intent: "SAVE_DRAFT", invoice: { notes: "a retry must return the committed operation", items: [] },
+    }, authCookie, csrfData.token, csrfData.cookie, "invoice-api-retry", "invoice-api-test-key"));
+    expect(lostResponseRetry.status).toBe(201);
+    await expect(lostResponseRetry.json()).resolves.toMatchObject({ invoice: { id: created.invoice.id } });
+    expect((temporary.connection.client.prepare("select count(*) as count from invoices").get() as { count: bigint }).count).toBe(1n);
+    expect((temporary.connection.client.prepare("select last_value as value from invoice_sequences").get() as { value: bigint }).value).toBe(1n);
     const fetchedResponse = await GET(new Request(`http://127.0.0.1:3000/api/invoices/${created.invoice.id}`, {
       headers: { cookie: authCookie, "x-request-id": "invoice-get" },
     }));

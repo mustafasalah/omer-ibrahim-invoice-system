@@ -688,10 +688,18 @@ button:disabled {
 }
 
 .invoice-editor-form {
+  display: block;
+}
+
+.invoice-editor-fieldset {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(270px, 330px);
   align-items: start;
   gap: 22px;
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
 }
 
 .invoice-editor-main {
@@ -1481,7 +1489,7 @@ button:disabled {
 }
 
 @media (max-width: 1050px) {
-  .invoice-editor-form { grid-template-columns: 1fr; }
+  .invoice-editor-fieldset { grid-template-columns: 1fr; }
   .invoice-summary { position: static; }
   .invoice-fields--four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .invoice-item__fields { grid-template-columns: repeat(3, minmax(0, 1fr)); }

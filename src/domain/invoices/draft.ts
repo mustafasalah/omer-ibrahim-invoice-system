@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { validationErrorCodes } from "@/domain/validation/codes";
 import { inspectDecimalInput } from "./decimal";
 import type { DecimalString } from "./contracts";
 
@@ -173,7 +174,25 @@ function cleanText(value: string | null | undefined): string | null {
 
 function issuesToFields(issues: readonly z.core.$ZodIssue[]): Record<string, string> {
   const fields: Record<string, string> = {};
-  for (const issue of issues) fields[issue.path.join(".") || "request"] ??= issue.message;
+  for (const issue of issues) {
+    const path = issue.path.join(".");
+    if (issue.code === "unrecognized_keys") {
+      for (const key of issue.keys) {
+        fields[[...issue.path, key].join(".") || "request"] ??= validationErrorCodes.UNKNOWN_FIELD;
+      }
+      continue;
+    }
+    let code: string = validationErrorCodes.INVALID_VALUE;
+    if (issue.code === "too_big") code = path === "invoice.items"
+      ? validationErrorCodes.TOO_MANY_ITEMS : validationErrorCodes.TEXT_TOO_LONG;
+    else if (issue.code === "too_small") code = path === "rowVersion"
+      ? validationErrorCodes.OUT_OF_RANGE : validationErrorCodes.REQUIRED;
+    else if (issue.code === "invalid_type") code = validationErrorCodes.INVALID_TYPE;
+    else if (issue.code === "invalid_format") code = path.endsWith("suggestionId")
+      ? validationErrorCodes.INVALID_ID : validationErrorCodes.INVALID_FORMAT;
+    else if (issue.code === "invalid_value") code = validationErrorCodes.INVALID_OPTION;
+    fields[path || "request"] ??= code;
+  }
   return fields;
 }
 

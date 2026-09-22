@@ -27,4 +27,16 @@ describe("settings validation", () => {
   ])("rejects unsafe or unknown input", (override) => {
     expect(() => parseSettingsPatch({ ...valid, ...override })).toThrow(SettingsValidationError);
   });
+
+  it("returns stable domain codes instead of raw validator messages", () => {
+    try {
+      parseSettingsPatch({ ...valid, settings: { ...valid.settings,
+        regional: { ...valid.settings.regional, timezone: "Not/AZone" } } });
+      throw new Error("Expected validation to fail.");
+    } catch (error) {
+      expect(error).toBeInstanceOf(SettingsValidationError);
+      expect((error as SettingsValidationError).fieldErrors["settings.regional.timezone"]).toBe("INVALID_TIMEZONE");
+      expect(JSON.stringify((error as SettingsValidationError).fieldErrors)).not.toMatch(/expected|received|invalid_type/iu);
+    }
+  });
 });

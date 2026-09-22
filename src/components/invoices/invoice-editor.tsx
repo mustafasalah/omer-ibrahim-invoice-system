@@ -16,6 +16,7 @@ import {
   emptyEditorItem,
   moveEditorItem,
   parseInvoiceResponse,
+  reconcileSavedInvoice,
   removeEditorItem,
   stateFromInvoice,
   toDraftInput,
@@ -49,11 +50,16 @@ function errorMessage(code: string | undefined, messages: Messages): string | un
     case "DUE_DATE_BEFORE_INVOICE_DATE": return messages.dueBeforeInvoice;
     case "FUTURE_DATE_FORBIDDEN": return messages.futureForbidden;
     case "TEXT_TOO_LONG":
-    case "Too big: expected string to have <=2000 characters": return messages.textTooLong;
+      return messages.textTooLong;
     case "REQUIRED": return messages.required;
     case "AT_LEAST_ONE_COMPLETE_ITEM_REQUIRED": return messages.itemRequired;
+    case "TOO_MANY_ITEMS": return messages.maxItems;
+    case "SUGGESTION_NOT_FOUND": return messages.suggestionNotFound;
+    case "EXPLICIT_REACTIVATION_REQUIRED": return messages.reactivationRequired;
+    case "NEXT_INVOICE_NUMBER_UNAVAILABLE":
+    case "INVOICE_NUMBER_COLLISION": return messages.numberUnavailable;
     case "INVALID_INTENT": return messages.unavailable;
-    default: return code;
+    default: return code ? messages.invalidValue : undefined;
   }
 }
 
@@ -82,9 +88,13 @@ export function InvoiceEditor({
   const [warnings, setWarnings] = useState<string[]>([]);
   const [copyFallback, setCopyFallback] = useState("");
   const [showIssueConfirm, setShowIssueConfirm] = useState(false);
+  const invoiceRef = useRef(firstState);
   const errorSummaryRef = useRef<HTMLDivElement>(null);
+  const conflictRef = useRef<HTMLElement>(null);
   const issueDialogRef = useRef<HTMLDivElement>(null);
   const issueButtonRef = useRef<HTMLButtonElement>(null);
+  const saveRequestIdRef = useRef<string | null>(null);
+  const saveInFlightRef = useRef(false);
   const issueRequestIdRef = useRef<string | null>(null);
   const issueInFlightRef = useRef(false);
   const focusIssueErrorsRef = useRef(false);
@@ -94,7 +104,12 @@ export function InvoiceEditor({
   const displayedPreview = invoice.serverPreview ?? preview;
 
   const updateInvoice = useCallback((updater: (current: InvoiceEditorState) => InvoiceEditorState) => {
-    setInvoice((current) => ({ ...updater(current), serverPreview: null }));
+    if (issueInFlightRef.current) return;
+    setInvoice((current) => {
+      const next = { ...updater(current), serverPreview: null };
+      invoiceRef.current = next;
+      return next;
+    });
     setStatus((current) => current === "saving" || current === "issuing" ? current : "ready");
     setStatusMessage("");
     setWarnings([]);
@@ -105,7 +120,7 @@ export function InvoiceEditor({
   }, []);
 
   const save = useCallback(async () => {
-    if (busy) return;
+    if (saveInFlightRef.current || issueInFlightRef.current || busy) return;
     const localErrors = { ...preview.fieldErrors };
     if (invoice.notes.length > 2_000) localErrors["invoice.notes"] = "TEXT_TOO_LONG";
     if (invoice.paymentTerms.length > 2_000) localErrors["invoice.paymentTerms"] = "TEXT_TOO_LONG";
@@ -117,6 +132,11 @@ export function InvoiceEditor({
       return;
     }
 
+    const requestFingerprint = editorDraftFingerprint(invoice);
+    const isCreate = invoice.id === null;
+    const requestId = isCreate ? saveRequestIdRef.current ?? newClientKey() : null;
+    if (isCreate && requestId) saveRequestIdRef.current = requestId;
+    saveInFlightRef.current = true;
     setStatus("saving");
     setStatusMessage("");
     setFieldErrors({});
@@ -124,18 +144,19 @@ export function InvoiceEditor({
     setCopyFallback("");
     try {
       const csrf = await getCsrfToken();
-      const isCreate = invoice.id === null;
       const target = isCreate ? "/api/invoices" : `/api/invoices/${encodeURIComponent(invoice.id ?? "")}`;
       const response = await fetch(target, {
         method: isCreate ? "POST" : "PATCH",
         credentials: "same-origin",
-        headers: { "content-type": "application/json", "x-csrf-token": csrf },
+        headers: { "content-type": "application/json", "x-csrf-token": csrf,
+          ...(requestId ? { "x-request-id": requestId, "idempotency-key": requestId } : {}) },
         body: JSON.stringify(isCreate
           ? { intent: "SAVE_DRAFT", invoice: toDraftInput(invoice) }
           : { rowVersion: invoice.rowVersion, invoice: toDraftInput(invoice) }),
       });
       const body = await response.json() as ApiErrorBody & { invoice?: unknown; warnings?: Array<{ code?: string }> };
       if (!response.ok) {
+        if (isCreate && response.status !== 500) saveRequestIdRef.current = null;
         setFieldErrors(body.error?.fieldErrors ?? {});
         setStatusMessage(body.error?.message ?? messages.unavailable);
         if (response.status === 401) { router.replace("/login"); return; }
@@ -153,20 +174,25 @@ export function InvoiceEditor({
         setStatusMessage(messages.malformed);
         return;
       }
-      const next = stateFromInvoice(saved);
-      setInvoice(next);
-      setBaseline(editorDraftFingerprint(next));
+      if (isCreate) saveRequestIdRef.current = null;
+      const reconciled = reconcileSavedInvoice(invoiceRef.current, saved, requestFingerprint);
+      invoiceRef.current = reconciled.state;
+      setInvoice(reconciled.state);
+      setBaseline(reconciled.baseline);
       setWarnings((body.warnings ?? []).filter((warning) => warning.code === "FUTURE_INVOICE_DATE").map(() => messages.futureDateWarning));
       setStatus("saved");
-      setStatusMessage(messages.saved.replace("{number}", saved.invoiceNumber));
-      if (isCreate) {
+      setStatusMessage((reconciled.changedDuringRequest ? messages.savedWithPendingChanges : messages.saved)
+        .replace("{number}", saved.invoiceNumber));
+      if (mode === "create" && !reconciled.changedDuringRequest) {
         window.setTimeout(() => router.replace(`/invoices/${encodeURIComponent(saved.id)}/edit?saved=1`), 0);
       }
     } catch {
       setStatus("unavailable");
       setStatusMessage(messages.unavailable);
+    } finally {
+      saveInFlightRef.current = false;
     }
-  }, [busy, focusFirstError, invoice, messages, preview.fieldErrors, router]);
+  }, [busy, focusFirstError, invoice, messages, mode, preview.fieldErrors, router]);
 
   const issue = useCallback(async () => {
     if (issueInFlightRef.current || busy) return;
@@ -212,6 +238,7 @@ export function InvoiceEditor({
       }
       issueRequestIdRef.current = null;
       const next = stateFromInvoice(issued);
+      invoiceRef.current = next;
       setInvoice(next);
       setBaseline(editorDraftFingerprint(next));
       setWarnings((body.warnings ?? []).filter((warning) => warning.code === "FUTURE_INVOICE_DATE").map(() => messages.futureDateWarning));
@@ -232,6 +259,11 @@ export function InvoiceEditor({
     focusIssueErrorsRef.current = false;
     errorSummaryRef.current?.focus();
   }, [fieldErrors, status]);
+
+  useEffect(() => {
+    if (status !== "stale") return;
+    requestAnimationFrame(() => conflictRef.current?.focus());
+  }, [status]);
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -337,6 +369,7 @@ export function InvoiceEditor({
       const latest = response.ok ? parseInvoiceResponse(body.invoice) : null;
       if (!latest || latest.invoiceStatus !== "DRAFT" || latest.isArchived) { setStatus("malformed"); return; }
       const next = stateFromInvoice(latest);
+      invoiceRef.current = next;
       setInvoice(next); setBaseline(editorDraftFingerprint(next)); setFieldErrors({}); setStatus("ready"); setCopyFallback("");
     } catch { setStatus("unavailable"); setStatusMessage(messages.unavailable); }
   }
@@ -376,7 +409,8 @@ export function InvoiceEditor({
         </div></div>
     </header>
 
-    {status === "stale" && <aside className="invoice-conflict" role="alertdialog" aria-labelledby="stale-title">
+    {status === "stale" && <aside className="invoice-conflict" role="alertdialog" aria-labelledby="stale-title"
+      tabIndex={-1} ref={conflictRef}>
       <div><strong id="stale-title">{messages.staleTitle}</strong><p>{messages.staleDescription}</p></div>
       <div className="invoice-conflict__actions"><button type="button" onClick={() => void loadLatest()}>{messages.loadLatest}</button>
         <button type="button" className="button-secondary" onClick={() => void copyInput()}>{messages.copyInput}</button></div>
@@ -391,6 +425,7 @@ export function InvoiceEditor({
     {copyFallback && <label className="copy-fallback"><span>{messages.copyFallback}</span><textarea readOnly value={copyFallback} onFocus={(event) => event.currentTarget.select()} /></label>}
 
     <form onSubmit={submit} className="invoice-editor-form" noValidate>
+      <fieldset className="invoice-editor-fieldset" disabled={status === "issuing"}>
       <div className="invoice-editor-main">
         <section className="invoice-section" aria-labelledby="invoice-info-title"><h2 id="invoice-info-title">{messages.invoiceInfo}</h2>
           <div className="invoice-fields invoice-fields--four">
@@ -452,6 +487,7 @@ export function InvoiceEditor({
       <div className="invoice-save-bar"><span aria-live="polite">{dirty ? messages.unsaved : status === "saved" || status === "issued" ? statusMessage : ""}</span>
         <div className="invoice-save-bar__actions"><button type="submit" className="button-secondary" disabled={busy || status === "forbidden" || status === "notFound" || status === "malformed"}>{status === "saving" ? messages.saving : messages.saveDraft}</button>
           <button type="button" ref={issueButtonRef} disabled={busy || status === "forbidden" || status === "notFound" || status === "malformed"} onClick={() => setShowIssueConfirm(true)}>{status === "issuing" ? messages.issuing : messages.issueInvoice}</button></div></div>
+      </fieldset>
     </form>
     {showIssueConfirm && <div className="invoice-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) { setShowIssueConfirm(false); issueButtonRef.current?.focus(); } }}>
       <div className="invoice-dialog" role="dialog" aria-modal="true" aria-labelledby="issue-dialog-title" aria-describedby="issue-dialog-description" ref={issueDialogRef}>

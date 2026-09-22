@@ -91,15 +91,14 @@ test("setup → login → settings → create and edit draft → logout", async 
 
   const issueButton = page.getByRole("button", { name: "إصدار الفاتورة" });
   await expect(issueButton).toBeEnabled();
-  await issueButton.focus();
-  await page.keyboard.press("Enter");
+  await issueButton.click();
   const issueDialog = page.getByRole("dialog", { name: "تأكيد إصدار الفاتورة" });
   await expect(issueDialog).toContainText("ستصبح الفاتورة رسمية");
   await expect(issueDialog.getByRole("button", { name: "العودة إلى المحرر" })).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(issueDialog).toBeHidden();
   await expect(issueButton).toBeFocused();
-  await page.keyboard.press("Enter");
+  await issueButton.press("Enter");
   const confirmIssueButton = issueDialog.getByRole("button", { name: "تأكيد الإصدار" });
   await page.keyboard.press("Tab");
   await expect(confirmIssueButton).toBeFocused();
@@ -130,8 +129,7 @@ test("setup → login → settings → create and edit draft → logout", async 
     }
     await route.continue();
   }, { times: 1 });
-  await issueButton.focus();
-  await page.keyboard.press("Enter");
+  await issueButton.press("Enter");
   await page.keyboard.press("Tab");
   await expect(confirmIssueButton).toBeFocused();
   await page.keyboard.press("Enter");
@@ -196,8 +194,16 @@ test("setup → login → settings → create and edit draft → logout", async 
   await expect(page.getByLabel("العملة")).toHaveValue(/SDG/u);
   await expect(page.getByLabel("اسم المستفيد")).toHaveValue("مستشفى الأمل");
   await quantities.first().fill("2.5");
+  await page.route(`**/api/invoices/${invoiceId}`, async (route) => {
+    if (route.request().method() === "PATCH") await new Promise((resolve) => setTimeout(resolve, 300));
+    await route.continue();
+  }, { times: 1 });
+  const pendingNotes = page.getByRole("textbox", { name: /^ملاحظات/u });
   await page.getByRole("button", { name: "حفظ كمسودة" }).click();
+  await expect(page.getByRole("button", { name: "جارٍ الحفظ…" })).toBeDisabled();
+  await pendingNotes.fill("تغيير أحدث أثناء الحفظ");
   await expect(page.locator(".invoice-notice--success")).toContainText("حُفظت المسودة");
+  await expect(pendingNotes).toHaveValue("تغيير أحدث أثناء الحفظ");
   const secondSavedResponse = await page.request.get(`/api/invoices/${invoiceId}`);
   const secondSaved = await secondSavedResponse.json() as { invoice: { invoiceNumber: string; rowVersion: number; totals: { grandTotalMinor: string } } };
   expect(secondSaved.invoice).toMatchObject({ invoiceNumber, rowVersion: firstSaved.invoice.rowVersion + 1, totals: { grandTotalMinor: "20000" } });
@@ -205,14 +211,21 @@ test("setup → login → settings → create and edit draft → logout", async 
   const notes = page.getByRole("textbox", { name: /^ملاحظات/u });
   await notes.fill("مدخلاتي وقت التعارض");
   await page.route(`**/api/invoices/${invoiceId}/issue`, async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 300));
     await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({
       error: { code: "CONFLICT", message: "توجد نسخة أحدث.", fieldErrors: { rowVersion: "3" }, requestId: "e2e-conflict" },
     }) });
   }, { times: 1 });
   await page.getByRole("button", { name: "إصدار الفاتورة" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "تأكيد الإصدار" }).click();
-  await expect(page.getByRole("alertdialog")).toContainText("توجد نسخة أحدث");
-  await page.getByRole("button", { name: "نسخ مدخلاتي" }).click();
+  await expect(notes).toBeDisabled();
+  await expect(quantities.first()).toBeDisabled();
+  const conflictPanel = page.getByRole("alertdialog");
+  await expect(conflictPanel).toContainText("توجد نسخة أحدث");
+  await expect(conflictPanel).toBeFocused();
+  const copyConflictInput = page.getByRole("button", { name: "نسخ مدخلاتي" });
+  await copyConflictInput.focus();
+  await page.keyboard.press("Enter");
   page.once("dialog", (prompt) => void prompt.accept());
   await page.getByRole("button", { name: "تحميل أحدث نسخة" }).click();
   await expect(page.getByRole("alertdialog")).toBeHidden();

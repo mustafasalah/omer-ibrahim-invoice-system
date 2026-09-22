@@ -16,6 +16,23 @@ function fromResponse(response: SettingsResponse): FormState {
     phonesText: response.settings.company.phones.join("\n") };
 }
 
+function validationMessage(code: string, messages: Messages): string {
+  switch (code) {
+    case "REQUIRED": return messages.required;
+    case "TEXT_TOO_LONG": return messages.textTooLong;
+    case "INVALID_EMAIL": return messages.invalidEmail;
+    case "INVALID_PHONE": return messages.invalidPhone;
+    case "INVALID_CURRENCY_CODE": return messages.invalidCurrencyCode;
+    case "INVALID_INVOICE_PREFIX": return messages.invalidPrefix;
+    case "INVALID_INVOICE_PATTERN": return messages.invalidPattern;
+    case "INVALID_TIMEZONE": return messages.invalidTimezone;
+    case "NEXT_INVOICE_NUMBER_UNAVAILABLE":
+    case "INVOICE_NUMBER_COLLISION": return messages.numberUnavailable;
+    case "UNKNOWN_FIELD": return messages.unknownField;
+    default: return messages.invalidValue;
+  }
+}
+
 export function SettingsForm({ messages }: { messages: Messages }) {
   const [form, setForm] = useState<FormState | null>(null);
   const [baseline, setBaseline] = useState("");
@@ -58,7 +75,10 @@ export function SettingsForm({ messages }: { messages: Messages }) {
 
   const update = <K extends keyof EditableSettings>(section: K, value: EditableSettings[K]) =>
     setForm((current) => current ? { ...current, [section]: value } : current);
-  const inputError = (path: string) => fieldErrors[`settings.${path}`] ?? fieldErrors[path];
+  const inputError = (path: string) => {
+    const code = fieldErrors[`settings.${path}`] ?? fieldErrors[path];
+    return code ? validationMessage(code, messages) : undefined;
+  };
   const field = (label: string, path: string, value: string | number, onChange: (value: string) => void,
     options: { type?: string; required?: boolean; min?: number; max?: number } = {}) => (
     <label className="settings-field"><span>{label}</span><input value={value} onChange={(event) => onChange(event.target.value)}

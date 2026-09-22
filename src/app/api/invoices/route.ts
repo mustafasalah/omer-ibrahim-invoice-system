@@ -3,6 +3,7 @@ import { requireCsrfProtection } from "@/server/auth/csrf";
 import { assertCapability, requireSession } from "@/server/auth/sessions";
 import { readInvoiceIntent } from "@/domain/invoices/draft";
 import { readJsonBody } from "@/server/http/json";
+import { getIdempotencyKey } from "@/server/http/idempotency";
 import { validationError } from "@/server/http/errors";
 import { withApiHandler } from "@/server/http/route";
 import { createInvoiceDraft, createIssuedInvoice } from "@/server/invoices/service";
@@ -21,6 +22,7 @@ export const POST = withApiHandler(async ({ request, requestId }) => {
     input,
     actor: { id: session.user.id, displayName: session.user.displayName, role: session.user.role },
     requestId,
+    ...(intent === "SAVE_DRAFT" ? { idempotencyKey: getIdempotencyKey(request, requestId) } : {}),
   });
   return NextResponse.json({ ...result, requestId }, { status: 201, headers: { "cache-control": "no-store" } });
 });

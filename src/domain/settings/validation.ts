@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { validationErrorCodes } from "@/domain/validation/codes";
 import { InvoiceNumberPatternError, parseInvoiceNumberPattern, validateInvoicePrefix } from "./numbering";
 
 export class SettingsValidationError extends Error {
@@ -42,7 +43,8 @@ const editableSettingsSchema = z.object({
   try {
     validateInvoicePrefix(settings.numbering.prefix);
   } catch {
-    context.addIssue({ code: "custom", path: ["numbering", "prefix"], message: "Invalid invoice prefix." });
+    context.addIssue({ code: "custom", path: ["numbering", "prefix"],
+      message: validationErrorCodes.INVALID_INVOICE_PREFIX });
   }
   try {
     const { sequenceWidth } = parseInvoiceNumberPattern(settings.numbering.pattern);
@@ -53,12 +55,14 @@ const editableSettingsSchema = z.object({
       throw new InvoiceNumberPatternError("Sequence start exceeds token width.");
     }
   } catch {
-    context.addIssue({ code: "custom", path: ["numbering", "pattern"], message: "Invalid invoice number pattern." });
+    context.addIssue({ code: "custom", path: ["numbering", "pattern"],
+      message: validationErrorCodes.INVALID_INVOICE_PATTERN });
   }
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: settings.regional.timezone }).format();
   } catch {
-    context.addIssue({ code: "custom", path: ["regional", "timezone"], message: "Invalid IANA timezone." });
+    context.addIssue({ code: "custom", path: ["regional", "timezone"],
+      message: validationErrorCodes.INVALID_TIMEZONE });
   }
 });
 
@@ -69,6 +73,26 @@ const patchSettingsSchema = z.object({
 
 export type SettingsPatchInput = z.infer<typeof patchSettingsSchema>;
 
+function settingsIssueCode(issue: z.core.$ZodIssue): string {
+  if (issue.code === "custom") return issue.message;
+  const path = issue.path.join(".").replace(/^settings\./u, "");
+  if (issue.code === "unrecognized_keys") return validationErrorCodes.UNKNOWN_FIELD;
+  if (path === "company.email") return validationErrorCodes.INVALID_EMAIL;
+  if (path.startsWith("company.phones")) return validationErrorCodes.INVALID_PHONE;
+  if (path === "currency.code") return validationErrorCodes.INVALID_CURRENCY_CODE;
+  if (issue.code === "too_big") return validationErrorCodes.TEXT_TOO_LONG;
+  if (issue.code === "too_small") {
+    return path === "company.nameAr" || path === "company.nameEn" || path === "currency.symbolAr" ||
+      path === "numbering.prefix" || path === "numbering.pattern" || path === "regional.timezone"
+      ? validationErrorCodes.REQUIRED
+      : validationErrorCodes.OUT_OF_RANGE;
+  }
+  if (issue.code === "invalid_type") return validationErrorCodes.INVALID_TYPE;
+  if (issue.code === "invalid_format") return validationErrorCodes.INVALID_FORMAT;
+  if (issue.code === "invalid_value") return validationErrorCodes.INVALID_OPTION;
+  return validationErrorCodes.INVALID_VALUE;
+}
+
 function normalizeNullable(value: string | null): string | null {
   return value === null || value === "" ? null : value;
 }
@@ -78,7 +102,13 @@ export function parseSettingsPatch(input: unknown): SettingsPatchInput {
   if (!parsed.success) {
     const fieldErrors: Record<string, string> = {};
     for (const issue of parsed.error.issues) {
-      fieldErrors[issue.path.join(".") || "request"] ??= issue.message;
+      if (issue.code === "unrecognized_keys") {
+        for (const key of issue.keys) {
+          fieldErrors[[...issue.path, key].join(".") || "request"] ??= validationErrorCodes.UNKNOWN_FIELD;
+        }
+        continue;
+      }
+      fieldErrors[issue.path.join(".") || "request"] ??= settingsIssueCode(issue);
     }
     throw new SettingsValidationError(fieldErrors);
   }

@@ -367,13 +367,17 @@ export function getInvoiceDraft(id: string, options: { connection?: DatabaseConn
 }
 
 export function createInvoiceDraft(options: { input: unknown; actor: DraftActor; requestId: string;
-  connection?: DatabaseConnection; now?: Date; faultInjector?: FaultInjector; auditAppender?: AuditAppender }): DraftResult {
+  idempotencyKey?: string; connection?: DatabaseConnection; now?: Date;
+  faultInjector?: FaultInjector; auditAppender?: AuditAppender }): DraftResult {
   let request;
   try { request = parseCreateDraft(options.input); }
   catch (error) { if (error instanceof DraftValidationError) throw validationError(error.fieldErrors); throw error; }
   const connection = options.connection ?? getDatabase();
   const at = options.now ?? new Date(); const now = at.toISOString();
+  const idempotencyKey = options.idempotencyKey ?? options.requestId;
   return withImmediateTransaction(connection.client, () => {
+    const repeated = previousDraftCreationRequest(connection, idempotencyKey, options.actor.id);
+    if (repeated) return { invoice: repeated, warnings: [] };
     const settings = settingsRow(connection, now);
     const dates = validateDates(request.invoice, dateInTimezone(at, settings.timezone), settings.timezone, at, options.actor.role);
     const beneficiary = prepareBeneficiary(connection, request.invoice.beneficiary);
@@ -408,11 +412,42 @@ export function createInvoiceDraft(options: { input: unknown; actor: DraftActor;
     (options.auditAppender ?? appendAuditEvent)(connection, { eventType: "INVOICE_CREATED",
       actorUserId: options.actor.id, actorDisplayName: options.actor.displayName, invoiceId: id,
       invoiceNumber: reserved.invoiceNumber, entityType: "INVOICE", entityId: id,
-      summary: getMessages().audit.invoiceCreated, changes: { invoiceStatus: { before: null, after: "DRAFT" } },
+      summary: getMessages().audit.invoiceCreated, changes: {
+        invoiceStatus: { before: null, after: "DRAFT" }, createIdempotencyKey: idempotencyKey,
+      },
       createdAt: now, requestId: options.requestId });
     options.faultInjector?.("afterAudit");
     return { invoice: toDto(connection, getRequiredInvoice(connection, id)), warnings: dates.warnings };
   });
+}
+
+function previousDraftCreationRequest(
+  connection: DatabaseConnection,
+  idempotencyKey: string,
+  actorId: string,
+): InvoiceDraftDto | null {
+  const rows = connection.client.prepare(`select invoice_id as invoiceId,request_id as requestId,
+      changes_json as changesJson from audit_logs where actor_user_id=? and event_type='INVOICE_CREATED'
+      and invoice_id is not null order by created_at,id`).all(actorId) as Array<{
+        invoiceId: string;
+        requestId: string;
+        changesJson: string | null;
+      }>;
+  for (const row of rows) {
+    try {
+      const changes = row.changesJson ? JSON.parse(row.changesJson) as {
+        invoiceStatus?: { after?: unknown };
+        createIdempotencyKey?: unknown;
+      } : null;
+      if (changes?.invoiceStatus?.after !== "DRAFT") continue;
+      if ((changes.createIdempotencyKey ?? row.requestId) !== idempotencyKey) continue;
+    } catch {
+      continue;
+    }
+    const invoice = readInvoiceRow(connection, row.invoiceId);
+    if (invoice) return toDto(connection, invoice);
+  }
+  return null;
 }
 
 export function updateInvoiceDraft(options: { id: string; input: unknown; actor: DraftActor; requestId: string;
