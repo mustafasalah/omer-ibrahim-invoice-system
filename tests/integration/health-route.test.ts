@@ -26,7 +26,7 @@ describe("GET /api/health", () => {
     expect(response.headers.get("x-request-id")).toBe("health-test-1");
     await expect(response.json()).resolves.toMatchObject({
       status: "ok",
-      checks: { database: "ok", schemaVersion: 2 },
+      checks: { database: "ok", schemaVersion: 3 },
       requestId: "health-test-1",
     });
   });

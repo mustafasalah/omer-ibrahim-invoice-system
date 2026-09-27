@@ -18,6 +18,19 @@ describe("request IDs", () => {
 
     expect(getRequestId(request)).toMatch(/^[0-9a-f-]{36}$/);
   });
+
+  it.each([
+    ["equal to", (key: string) => key],
+    ["containing", (key: string) => `request-${key}`],
+  ])("never reflects a request ID %s the idempotency key", (_label, requestIdFromKey) => {
+    const rawKey = "draft-create-key-123";
+    const requestId = getRequestId(new Request("http://localhost/api/invoices", {
+      headers: { "x-request-id": requestIdFromKey(rawKey), "idempotency-key": rawKey },
+    }));
+
+    expect(requestId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(requestId).not.toBe(rawKey);
+  });
 });
 
 describe("idempotency keys", () => {

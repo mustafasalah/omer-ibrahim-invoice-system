@@ -12,6 +12,12 @@ import {
   removeEditorItem,
   toDraftInput,
 } from "@/domain/invoices/editor";
+import {
+  canonicalDraftPayload,
+  pendingCreateHasNewerInput,
+  snapshotPendingCreate,
+  transitionPendingCreate,
+} from "@/domain/invoices/pending-create";
 import type { InvoiceDraftDto } from "@/domain/invoices/draft";
 
 const defaults = {
@@ -113,5 +119,46 @@ describe("invoice draft editor state", () => {
     expect(reconciled.state).toMatchObject({ id: saved.id, invoiceNumber: saved.invoiceNumber,
       rowVersion: 1, notes: "typed while saving" });
     expect(reconciled.baseline).not.toBe(editorDraftFingerprint(reconciled.state));
+  });
+
+  it("keeps an immutable canonical create payload throughout ambiguous recovery", () => {
+    const editor = createEditorState(defaults, "first");
+    editor.beneficiary.name = "Original beneficiary";
+    editor.notes = "original";
+    const originalPayload = toDraftInput(editor);
+    const pending = snapshotPendingCreate("fixed-idempotency-key", originalPayload);
+
+    originalPayload.notes = "mutated outside the snapshot";
+    if (originalPayload.beneficiary) originalPayload.beneficiary.name = "Changed outside";
+    editor.notes = "newer local input";
+
+    expect(pending).toMatchObject({
+      idempotencyKey: "fixed-idempotency-key",
+      outcome: "in-flight",
+      payload: { notes: "original", beneficiary: { name: "Original beneficiary" } },
+    });
+    expect(pending.fingerprint).toBe(canonicalDraftPayload(pending.payload));
+    expect(pendingCreateHasNewerInput(pending, toDraftInput(editor))).toBe(true);
+    expect(transitionPendingCreate(pending, "ambiguous")).toMatchObject({
+      idempotencyKey: pending.idempotencyKey,
+      payload: pending.payload,
+      fingerprint: pending.fingerprint,
+      outcome: "ambiguous",
+    });
+    expect(transitionPendingCreate(pending, "resolved").outcome).toBe("resolved");
+  });
+
+  it("fingerprints equivalent draft payloads independently of object key order", () => {
+    const first = toDraftInput(createEditorState(defaults, "first"));
+    const reordered = {
+      paymentTerms: first.paymentTerms,
+      notes: first.notes,
+      items: first.items,
+      beneficiary: first.beneficiary,
+      dueDate: first.dueDate,
+      invoiceDate: first.invoiceDate,
+    };
+
+    expect(canonicalDraftPayload(reordered)).toBe(canonicalDraftPayload(first));
   });
 });

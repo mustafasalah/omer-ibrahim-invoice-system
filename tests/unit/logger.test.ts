@@ -18,6 +18,8 @@ describe("local technical logging", () => {
       passwordConfirmation: "top-secret-confirmation",
       passwordHash: "$argon2id$secret-hash",
       token: "raw-session-token",
+      idempotencyKey: "raw-idempotency-key",
+      req: { headers: { "idempotency-key": "raw-idempotency-header" } },
       invoice: { grandTotalMinor: "100000" },
       amountMinor: "99999",
       safeContext: "health-check",
@@ -29,6 +31,8 @@ describe("local technical logging", () => {
     expect(output).not.toContain("top-secret-confirmation");
     expect(output).not.toContain("secret-hash");
     expect(output).not.toContain("raw-session-token");
+    expect(output).not.toContain("raw-idempotency-key");
+    expect(output).not.toContain("raw-idempotency-header");
     expect(output).not.toContain("100000");
     expect(output).not.toContain("99999");
   });

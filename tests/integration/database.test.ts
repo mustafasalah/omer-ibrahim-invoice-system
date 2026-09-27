@@ -17,6 +17,42 @@ import { AppError, apiErrorCodes } from "@/server/http/errors";
 import { withImmediateTransaction } from "@/server/db/transaction";
 import { createTemporaryDatabase } from "../fixtures/database";
 
+type MigrationJournal = {
+  dialect: string;
+  entries: Array<{ tag: string } & Record<string, unknown>>;
+  version: string;
+};
+
+function prepareMigrationSubset(
+  directory: string,
+  currentMigrations: string,
+  migrationCount: number,
+): string {
+  const subsetMigrations = path.join(directory, `schema-v${migrationCount}-migrations`);
+  const subsetMeta = path.join(subsetMigrations, "meta");
+  mkdirSync(subsetMeta, { recursive: true });
+
+  const currentJournal = JSON.parse(
+    readFileSync(path.join(currentMigrations, "meta", "_journal.json"), "utf8"),
+  ) as MigrationJournal;
+  const subsetEntries = currentJournal.entries.slice(0, migrationCount);
+
+  for (const entry of subsetEntries) {
+    copyFileSync(
+      path.join(currentMigrations, `${entry.tag}.sql`),
+      path.join(subsetMigrations, `${entry.tag}.sql`),
+    );
+  }
+
+  writeFileSync(
+    path.join(subsetMeta, "_journal.json"),
+    `${JSON.stringify({ ...currentJournal, entries: subsetEntries }, null, 2)}\n`,
+    "utf8",
+  );
+
+  return subsetMigrations;
+}
+
 describe("SQLite foundation", () => {
   it("migrates an empty database idempotently with the Milestone 1 tables", () => {
     const temporary = createTemporaryDatabase();
@@ -52,7 +88,7 @@ describe("SQLite foundation", () => {
       const migrationCount = temporary.connection.client
         .prepare("select count(*) as count from __drizzle_migrations")
         .get() as { count: bigint };
-      expect(migrationCount.count).toBe(2n);
+      expect(migrationCount.count).toBe(3n);
     } finally {
       temporary.dispose();
     }
@@ -67,7 +103,7 @@ describe("SQLite foundation", () => {
         journalMode: "wal",
         foreignKeys: true,
         busyTimeoutMs: 5_000,
-        schemaVersion: 2,
+        schemaVersion: 3,
       });
 
       const rawInteger = temporary.connection.client.prepare("select 1 as value").get() as {
@@ -82,38 +118,11 @@ describe("SQLite foundation", () => {
   it("upgrades schema version 1, removes legacy replay data, and preserves the audit event", () => {
     const temporaryRoot = path.resolve(tmpdir());
     const directory = mkdtempSync(path.join(temporaryRoot, "oims-v1-upgrade-test-"));
-    const versionOneMigrations = path.join(directory, "v1-migrations");
-    const versionOneMeta = path.join(versionOneMigrations, "meta");
     const currentMigrations = path.resolve(process.cwd(), "drizzle");
+    const versionOneMigrations = prepareMigrationSubset(directory, currentMigrations, 1);
     const connection = openDatabase(path.join(directory, "version-one.sqlite"));
 
     try {
-      mkdirSync(versionOneMeta, { recursive: true });
-      copyFileSync(
-        path.join(currentMigrations, "0000_supreme_blink.sql"),
-        path.join(versionOneMigrations, "0000_supreme_blink.sql"),
-      );
-
-      const currentJournal = JSON.parse(
-        readFileSync(path.join(currentMigrations, "meta", "_journal.json"), "utf8"),
-      ) as {
-        dialect: string;
-        entries: Array<Record<string, unknown>>;
-        version: string;
-      };
-      writeFileSync(
-        path.join(versionOneMeta, "_journal.json"),
-        `${JSON.stringify(
-          {
-            ...currentJournal,
-            entries: currentJournal.entries.slice(0, 1),
-          },
-          null,
-          2,
-        )}\n`,
-        "utf8",
-      );
-
       migrateDatabase(connection, versionOneMigrations);
 
       const versionOneMigrationCount = connection.client
@@ -205,17 +214,21 @@ describe("SQLite foundation", () => {
         .prepare("select count(*) as count from invoice_idempotency_records")
         .get() as { count: bigint };
       const storedAudit = connection.client
-        .prepare("select event_type, summary, changes_json from audit_logs where id = ?")
+        .prepare(
+          "select event_type, summary, changes_json, request_id from audit_logs where id = ?",
+        )
         .get("legacy-audit") as {
         changes_json: string;
         event_type: string;
+        request_id: string;
         summary: string;
       };
 
-      expect(upgradedMigrationCount.count).toBe(2n);
+      expect(upgradedMigrationCount.count).toBe(3n);
       expect(idempotencyRecordCount.count).toBe(0n);
       expect(storedAudit.event_type).toBe("INVOICE_CREATED");
       expect(storedAudit.summary).toBe("Legacy invoice created");
+      expect(storedAudit.request_id).toBe("redacted:audit-event:legacy-audit");
       expect(JSON.parse(storedAudit.changes_json)).toEqual({
         invoiceStatus: { before: null, after: "DRAFT" },
         retainedMetadata: { source: "milestone-one", keep: true },
@@ -240,9 +253,211 @@ describe("SQLite foundation", () => {
         .prepare("select count(*) as count from audit_logs where id = ?")
         .get("legacy-audit") as { count: bigint };
 
-      expect(afterSecondMigration.count).toBe(2n);
+      expect(afterSecondMigration.count).toBe(3n);
       expect(auditAfterSecondMigration.count).toBe(1n);
-      expect(checkDatabase(connection).schemaVersion).toBe(2);
+      expect(checkDatabase(connection).schemaVersion).toBe(3);
+    } finally {
+      connection.client.close();
+      const resolvedDirectory = path.resolve(directory);
+      const relative = path.relative(temporaryRoot, resolvedDirectory);
+
+      if (relative.startsWith("..") || path.isAbsolute(relative) || relative === "") {
+        throw new Error("Refusing to remove a directory outside the test temp root.");
+      }
+
+      rmSync(resolvedDirectory, { force: true, recursive: true });
+    }
+  });
+
+  it("upgrades schema version 2 and redacts legacy invoice idempotency keys in audit request ids", () => {
+    const temporaryRoot = path.resolve(tmpdir());
+    const directory = mkdtempSync(path.join(temporaryRoot, "oims-v2-upgrade-test-"));
+    const currentMigrations = path.resolve(process.cwd(), "drizzle");
+    const versionTwoMigrations = prepareMigrationSubset(directory, currentMigrations, 2);
+    const connection = openDatabase(path.join(directory, "version-two.sqlite"));
+
+    try {
+      migrateDatabase(connection, versionTwoMigrations);
+
+      const migrationCountBeforeUpgrade = connection.client
+        .prepare("select count(*) as count from __drizzle_migrations")
+        .get() as { count: bigint };
+      expect(migrationCountBeforeUpgrade.count).toBe(2n);
+
+      const now = "2026-09-22T23:59:59.000Z";
+      connection.client
+        .prepare(
+          `insert into users (
+            id, username, display_name, role, password_hash, created_at, updated_at
+          ) values (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run("legacy-v2-user", "legacy-v2-admin", "Legacy V2 Admin", "ADMIN", "legacy-hash", now, now);
+      connection.client
+        .prepare(
+          `insert into invoices (
+            id, invoice_number, invoice_date, currency_code, currency_symbol,
+            currency_decimals, created_at, created_by, updated_at, updated_by
+          ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "legacy-v2-invoice",
+          "OI-2026-00002",
+          "2026-09-23",
+          "SDG",
+          "SDG",
+          2,
+          now,
+          "legacy-v2-user",
+          now,
+          "legacy-v2-user",
+        );
+
+      const legacyChanges = {
+        invoiceStatus: { before: null, after: "DRAFT" },
+        retainedMetadata: { source: "schema-v2", keep: true },
+      };
+      const legacyRawIdempotencyKey = "legacy-raw-idempotency-key-from-request-id";
+      connection.client
+        .prepare(
+          `insert into audit_logs (
+            id, event_type, actor_user_id, actor_display_name, invoice_id,
+            invoice_number, entity_type, entity_id, summary, changes_json,
+            created_at, request_id
+          ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "legacy-v2-audit",
+          "INVOICE_CREATED",
+          "legacy-v2-user",
+          "Legacy V2 Admin",
+          "legacy-v2-invoice",
+          "OI-2026-00002",
+          "INVOICE",
+          "legacy-v2-invoice",
+          "Legacy V2 invoice created",
+          JSON.stringify(legacyChanges),
+          now,
+          legacyRawIdempotencyKey,
+        );
+      connection.client
+        .prepare(
+          `insert into audit_logs (
+            id, event_type, actor_user_id, actor_display_name, entity_type,
+            entity_id, summary, changes_json, created_at, request_id
+          ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "unrelated-v2-audit",
+          "SETTINGS_UPDATED",
+          "legacy-v2-user",
+          "Legacy V2 Admin",
+          "SETTINGS",
+          "default",
+          "Unrelated settings event",
+          JSON.stringify({ retained: true }),
+          now,
+          "unrelated-request-id",
+        );
+
+      migrateDatabase(connection, currentMigrations);
+
+      const migrationCountAfterUpgrade = connection.client
+        .prepare("select count(*) as count from __drizzle_migrations")
+        .get() as { count: bigint };
+      expect(migrationCountAfterUpgrade.count).toBe(3n);
+
+      const storedAudit = connection.client
+        .prepare(
+          `select id, event_type as eventType, actor_user_id as actorUserId,
+            actor_display_name as actorDisplayName, invoice_id as invoiceId,
+            invoice_number as invoiceNumber, entity_type as entityType,
+            entity_id as entityId, summary, changes_json as changesJson,
+            created_at as createdAt, request_id as requestId
+          from audit_logs where id = ?`,
+        )
+        .get("legacy-v2-audit") as {
+        actorDisplayName: string;
+        actorUserId: string;
+        changesJson: string;
+        createdAt: string;
+        entityId: string;
+        entityType: string;
+        eventType: string;
+        id: string;
+        invoiceId: string;
+        invoiceNumber: string;
+        requestId: string;
+        summary: string;
+      };
+
+      expect(storedAudit).toEqual({
+        id: "legacy-v2-audit",
+        eventType: "INVOICE_CREATED",
+        actorUserId: "legacy-v2-user",
+        actorDisplayName: "Legacy V2 Admin",
+        invoiceId: "legacy-v2-invoice",
+        invoiceNumber: "OI-2026-00002",
+        entityType: "INVOICE",
+        entityId: "legacy-v2-invoice",
+        summary: "Legacy V2 invoice created",
+        changesJson: JSON.stringify(legacyChanges),
+        createdAt: now,
+        requestId: "redacted:audit-event:legacy-v2-audit",
+      });
+      expect(JSON.parse(storedAudit.changesJson)).toEqual(legacyChanges);
+
+      const unrelatedRequestId = connection.client
+        .prepare("select request_id as requestId from audit_logs where id = ?")
+        .get("unrelated-v2-audit") as { requestId: string };
+      expect(unrelatedRequestId.requestId).toBe("unrelated-request-id");
+      expect(
+        (
+          connection.client
+            .prepare("select count(*) as count from audit_logs where request_id = ?")
+            .get(legacyRawIdempotencyKey) as { count: bigint }
+        ).count,
+      ).toBe(0n);
+
+      expect(() =>
+        connection.client
+          .prepare("update audit_logs set summary = ? where id = ?")
+          .run("changed", "legacy-v2-audit"),
+      ).toThrow(/append-only/);
+      expect(() =>
+        connection.client
+          .prepare("delete from audit_logs where id = ?")
+          .run("legacy-v2-audit"),
+      ).toThrow(/append-only/);
+
+      connection.client
+        .prepare(
+          `insert into audit_logs (
+            id, event_type, summary, created_at, request_id
+          ) values (?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "post-v2-migration-audit",
+          "INVOICE_CREATED",
+          "Created after request-id redaction migration",
+          "2026-09-24T00:00:00.000Z",
+          "new-request-id",
+        );
+
+      migrateDatabase(connection, currentMigrations);
+
+      const migrationCountAfterSecondRun = connection.client
+        .prepare("select count(*) as count from __drizzle_migrations")
+        .get() as { count: bigint };
+      const requestIdAfterSecondRun = connection.client
+        .prepare("select request_id as requestId from audit_logs where id = ?")
+        .get("legacy-v2-audit") as { requestId: string };
+      const newRequestIdAfterSecondRun = connection.client
+        .prepare("select request_id as requestId from audit_logs where id = ?")
+        .get("post-v2-migration-audit") as { requestId: string };
+      expect(migrationCountAfterSecondRun.count).toBe(3n);
+      expect(requestIdAfterSecondRun.requestId).toBe("redacted:audit-event:legacy-v2-audit");
+      expect(newRequestIdAfterSecondRun.requestId).toBe("new-request-id");
+      expect(checkDatabase(connection).schemaVersion).toBe(3);
     } finally {
       connection.client.close();
       const resolvedDirectory = path.resolve(directory);

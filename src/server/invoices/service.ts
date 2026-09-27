@@ -13,7 +13,7 @@ import { getMessages } from "@/i18n";
 import { appendAuditEvent, type AuditEvent } from "@/server/audit/service";
 import { getDatabase, type DatabaseConnection } from "@/server/db/connection";
 import { withImmediateTransaction } from "@/server/db/transaction";
-import { conflictError, forbiddenError, idempotencyKeyReusedError, notFoundError,
+import { conflictError, forbiddenError, idempotencyKeyReusedError, idempotencyReplayUnavailableError, notFoundError,
   validationError } from "@/server/http/errors";
 import {
   cleanupExpiredIdempotencyRecords,
@@ -451,6 +451,23 @@ export function createInvoiceDraft(options: { input: unknown; actor: DraftActor;
     });
     options.faultInjector?.("afterIdempotency");
     return result;
+  });
+}
+
+export function replayInvoiceDraftCreation(options: { input: unknown; actor: Pick<DraftActor, "id">;
+  idempotencyKey: string; connection?: DatabaseConnection; now?: Date }): DraftResult {
+  try { parseCreateDraft(options.input); }
+  catch (error) { if (error instanceof DraftValidationError) throw validationError(error.fieldErrors); throw error; }
+  const connection = options.connection ?? getDatabase();
+  const now = (options.now ?? new Date()).toISOString();
+  const keyHash = hashIdempotencyKey(options.idempotencyKey);
+  const requestFingerprint = fingerprintIdempotencyRequest(options.input);
+  return withImmediateTransaction(connection.client, () => {
+    const stored = findInvoiceIdempotencyRecord({ connection, userId: options.actor.id, keyHash });
+    if (!stored || stored.expiresAt <= now) throw idempotencyReplayUnavailableError();
+    if (stored.requestFingerprint !== requestFingerprint) throw idempotencyKeyReusedError();
+    if (stored.responseStatus !== 201n) throw new Error("Invalid stored idempotency response status.");
+    return readStoredDraftCreationReplay(stored.responseJson);
   });
 }
 

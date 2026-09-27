@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type MouseEvent } from "react";
 import { getCsrfToken } from "@/components/auth/client-api";
+import { createSecureClientId, SecureRandomUnavailableError } from "@/components/invoices/secure-client-id";
 import { asMinorUnitString } from "@/domain/invoices/contracts";
 import { inspectDecimalInput } from "@/domain/invoices/decimal";
 import {
@@ -26,16 +27,18 @@ import {
 } from "@/domain/invoices/editor";
 import { MAX_DRAFT_ITEMS, type InvoiceDraftDto, type InvoiceEditorDefaults } from "@/domain/invoices/draft";
 import { formatMoney } from "@/domain/invoices/format";
+import {
+  pendingCreateHasNewerInput,
+  snapshotPendingCreate,
+  transitionPendingCreate,
+  type PendingCreate,
+} from "@/domain/invoices/pending-create";
 import type { MessageShape } from "@/i18n/types";
 
 type Messages = MessageShape["invoiceEditor"];
-type EditorStatus = "ready" | "saving" | "saved" | "issuing" | "issued" | "validation" | "unavailable" |
+type EditorStatus = "ready" | "saving" | "recovering" | "recovery" | "saved" | "issuing" | "issued" | "validation" | "unavailable" |
   "forbidden" | "notFound" | "malformed" | "stale";
 type ApiErrorBody = { error?: { code?: string; message?: string; fieldErrors?: Record<string, string>; requestId?: string } };
-
-function newClientKey(): string {
-  return typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `line-${Date.now()}`;
-}
 
 function errorMessage(code: string | undefined, messages: Messages): string | undefined {
   switch (code) {
@@ -93,13 +96,16 @@ export function InvoiceEditor({
   const conflictRef = useRef<HTMLElement>(null);
   const issueDialogRef = useRef<HTMLDivElement>(null);
   const issueButtonRef = useRef<HTMLButtonElement>(null);
-  const saveIdempotencyKeyRef = useRef<string | null>(null);
+  const pendingCreateRef = useRef<PendingCreate | null>(null);
   const saveInFlightRef = useRef(false);
   const issueRequestIdRef = useRef<string | null>(null);
   const issueInFlightRef = useRef(false);
   const focusIssueErrorsRef = useRef(false);
   const dirty = editorDraftFingerprint(invoice) !== baseline;
-  const busy = status === "saving" || status === "issuing";
+  const busy = status === "saving" || status === "recovering" || status === "issuing";
+  const hasUnresolvedCreate = invoice.id === null
+    && (status === "saving" || status === "recovering" || status === "recovery");
+  const shouldWarnOnLeave = dirty || hasUnresolvedCreate;
   const preview = useMemo(() => calculateEditorPreview(invoice.items, invoice.currency), [invoice.items, invoice.currency]);
   const displayedPreview = invoice.serverPreview ?? preview;
 
@@ -110,10 +116,24 @@ export function InvoiceEditor({
       invoiceRef.current = next;
       return next;
     });
-    setStatus((current) => current === "saving" || current === "issuing" ? current : "ready");
-    setStatusMessage("");
+    setStatus((current) => {
+      if (current === "saving" || current === "recovering" || current === "issuing") return current;
+      return pendingCreateRef.current?.outcome === "ambiguous" ? "recovery" : "ready";
+    });
+    if (pendingCreateRef.current?.outcome !== "ambiguous") setStatusMessage("");
     setWarnings([]);
   }, []);
+
+  const createEditorClientKey = useCallback((): string | null => {
+    try {
+      return createSecureClientId();
+    } catch (error) {
+      if (!(error instanceof SecureRandomUnavailableError)) throw error;
+      setStatus("unavailable");
+      setStatusMessage(messages.secureRandomUnavailable);
+      return null;
+    }
+  }, [messages.secureRandomUnavailable]);
 
   const focusFirstError = useCallback(() => {
     requestAnimationFrame(() => document.querySelector<HTMLElement>("[aria-invalid='true']")?.focus());
@@ -121,45 +141,82 @@ export function InvoiceEditor({
 
   const save = useCallback(async () => {
     if (saveInFlightRef.current || issueInFlightRef.current || busy) return;
-    const localErrors = { ...preview.fieldErrors };
-    if (invoice.notes.length > 2_000) localErrors["invoice.notes"] = "TEXT_TOO_LONG";
-    if (invoice.paymentTerms.length > 2_000) localErrors["invoice.paymentTerms"] = "TEXT_TOO_LONG";
-    if (Object.keys(localErrors).length > 0) {
-      setStatus("validation");
-      setFieldErrors(localErrors);
-      setStatusMessage(messages.validationSummary);
-      focusFirstError();
+    const hasAmbiguousCreate = invoice.id === null && pendingCreateRef.current?.outcome === "ambiguous";
+    if (!hasAmbiguousCreate) {
+      const localErrors = { ...preview.fieldErrors };
+      if (invoice.notes.length > 2_000) localErrors["invoice.notes"] = "TEXT_TOO_LONG";
+      if (invoice.paymentTerms.length > 2_000) localErrors["invoice.paymentTerms"] = "TEXT_TOO_LONG";
+      if (Object.keys(localErrors).length > 0) {
+        setStatus("validation");
+        setFieldErrors(localErrors);
+        setStatusMessage(messages.validationSummary);
+        focusFirstError();
+        return;
+      }
+    }
+
+    const isCreate = invoice.id === null;
+    let pendingCreate = pendingCreateRef.current;
+    const isRecovery = isCreate && pendingCreate?.outcome === "ambiguous";
+    let requestId: string | null = null;
+
+    try {
+      if (isCreate) {
+        requestId = createSecureClientId();
+        if (!pendingCreate) {
+          pendingCreate = snapshotPendingCreate(createSecureClientId(), toDraftInput(invoice));
+        } else if (pendingCreate.outcome === "ambiguous") {
+          pendingCreate = transitionPendingCreate(pendingCreate, "in-flight");
+        } else {
+          return;
+        }
+        pendingCreateRef.current = pendingCreate;
+      }
+    } catch (error) {
+      if (!(error instanceof SecureRandomUnavailableError)) throw error;
+      setStatus("unavailable");
+      setStatusMessage(messages.secureRandomUnavailable);
       return;
     }
 
-    const requestFingerprint = editorDraftFingerprint(invoice);
-    const isCreate = invoice.id === null;
-    const idempotencyKey = isCreate ? saveIdempotencyKeyRef.current ?? newClientKey() : null;
-    if (isCreate && idempotencyKey) saveIdempotencyKeyRef.current = idempotencyKey;
-    const requestId = isCreate ? newClientKey() : null;
+    const requestFingerprint = isCreate
+      ? pendingCreate?.fingerprint ?? editorDraftFingerprint(invoice)
+      : editorDraftFingerprint(invoice);
     saveInFlightRef.current = true;
-    setStatus("saving");
+    setStatus(isRecovery ? "recovering" : "saving");
     setStatusMessage("");
     setFieldErrors({});
     setWarnings([]);
     setCopyFallback("");
     try {
       const csrf = await getCsrfToken();
-      const target = isCreate ? "/api/invoices" : `/api/invoices/${encodeURIComponent(invoice.id ?? "")}`;
+      const target = isRecovery ? "/api/invoices/replay"
+        : isCreate ? "/api/invoices" : `/api/invoices/${encodeURIComponent(invoice.id ?? "")}`;
       const response = await fetch(target, {
         method: isCreate ? "POST" : "PATCH",
         credentials: "same-origin",
         headers: { "content-type": "application/json", "x-csrf-token": csrf,
-          ...(requestId && idempotencyKey
-            ? { "x-request-id": requestId, "idempotency-key": idempotencyKey }
+          ...(requestId && pendingCreate
+            ? { "x-request-id": requestId, "idempotency-key": pendingCreate.idempotencyKey }
             : {}) },
         body: JSON.stringify(isCreate
-          ? { intent: "SAVE_DRAFT", invoice: toDraftInput(invoice) }
+          ? { intent: "SAVE_DRAFT", invoice: pendingCreate?.payload }
           : { rowVersion: invoice.rowVersion, invoice: toDraftInput(invoice) }),
       });
       const body = await response.json() as ApiErrorBody & { invoice?: unknown; warnings?: Array<{ code?: string }> };
       if (!response.ok) {
-        if (isCreate && response.status !== 500) saveIdempotencyKeyRef.current = null;
+        if (isCreate && pendingCreate
+          && (isRecovery || response.status >= 500 || body.error?.code === "IDEMPOTENCY_KEY_REUSED")) {
+          pendingCreateRef.current = transitionPendingCreate(pendingCreate, "ambiguous");
+          setFieldErrors({});
+          setStatus("recovery");
+          setStatusMessage(messages.recoveryRequired);
+          return;
+        }
+        if (isCreate && pendingCreate) {
+          pendingCreateRef.current = transitionPendingCreate(pendingCreate, "resolved");
+          pendingCreateRef.current = null;
+        }
         setFieldErrors(body.error?.fieldErrors ?? {});
         setStatusMessage(body.error?.message ?? messages.unavailable);
         if (response.status === 401) { router.replace("/login"); return; }
@@ -173,16 +230,74 @@ export function InvoiceEditor({
 
       const saved = parseInvoiceResponse(body.invoice);
       if (!saved || saved.invoiceStatus !== "DRAFT" || saved.isArchived) {
-        setStatus("malformed");
-        setStatusMessage(messages.malformed);
+        if (isCreate && pendingCreate) {
+          pendingCreateRef.current = transitionPendingCreate(pendingCreate, "ambiguous");
+          setStatus("recovery");
+          setStatusMessage(messages.recoveryRequired);
+        } else {
+          setStatus("malformed");
+          setStatusMessage(messages.malformed);
+        }
         return;
       }
-      if (isCreate) saveIdempotencyKeyRef.current = null;
-      const reconciled = reconcileSavedInvoice(invoiceRef.current, saved, requestFingerprint);
+
+      const latestEditor = invoiceRef.current;
+      const hasNewerRecoveryInput = Boolean(isRecovery && pendingCreate
+        && pendingCreateHasNewerInput(pendingCreate, toDraftInput(latestEditor)));
+      const reconciled = reconcileSavedInvoice(latestEditor, saved, requestFingerprint);
       invoiceRef.current = reconciled.state;
       setInvoice(reconciled.state);
       setBaseline(reconciled.baseline);
       setWarnings((body.warnings ?? []).filter((warning) => warning.code === "FUTURE_INVOICE_DATE").map(() => messages.futureDateWarning));
+
+      if (isCreate && pendingCreate) {
+        pendingCreateRef.current = transitionPendingCreate(pendingCreate, "resolved");
+        pendingCreateRef.current = null;
+      }
+
+      if (hasNewerRecoveryInput) {
+        const recoveredState = invoiceRef.current;
+        const patchFingerprint = editorDraftFingerprint(recoveredState);
+        const patchResponse = await fetch(`/api/invoices/${encodeURIComponent(saved.id)}`, {
+          method: "PATCH",
+          credentials: "same-origin",
+          headers: { "content-type": "application/json", "x-csrf-token": csrf },
+          body: JSON.stringify({ rowVersion: saved.rowVersion, invoice: toDraftInput(recoveredState) }),
+        });
+        const patchBody = await patchResponse.json() as ApiErrorBody & { invoice?: unknown; warnings?: Array<{ code?: string }> };
+        if (!patchResponse.ok) {
+          setFieldErrors(patchBody.error?.fieldErrors ?? {});
+          setStatusMessage(patchBody.error?.message ?? messages.unavailable);
+          if (patchResponse.status === 401) { router.replace("/login"); return; }
+          if (patchResponse.status === 403) setStatus("forbidden");
+          else if (patchResponse.status === 404) setStatus("notFound");
+          else if (patchResponse.status === 409) setStatus("stale");
+          else if (patchResponse.status === 422) { setStatus("validation"); focusFirstError(); }
+          else setStatus("unavailable");
+          return;
+        }
+
+        const patched = parseInvoiceResponse(patchBody.invoice);
+        if (!patched || patched.invoiceStatus !== "DRAFT" || patched.isArchived) {
+          setStatus("malformed");
+          setStatusMessage(messages.malformed);
+          return;
+        }
+        const patchReconciled = reconcileSavedInvoice(invoiceRef.current, patched, patchFingerprint);
+        invoiceRef.current = patchReconciled.state;
+        setInvoice(patchReconciled.state);
+        setBaseline(patchReconciled.baseline);
+        setWarnings((patchBody.warnings ?? []).filter((warning) => warning.code === "FUTURE_INVOICE_DATE")
+          .map(() => messages.futureDateWarning));
+        setStatus("saved");
+        setStatusMessage((patchReconciled.changedDuringRequest ? messages.savedWithPendingChanges : messages.saved)
+          .replace("{number}", patched.invoiceNumber));
+        if (mode === "create" && !patchReconciled.changedDuringRequest) {
+          window.setTimeout(() => router.replace(`/invoices/${encodeURIComponent(patched.id)}/edit?saved=1`), 0);
+        }
+        return;
+      }
+
       setStatus("saved");
       setStatusMessage((reconciled.changedDuringRequest ? messages.savedWithPendingChanges : messages.saved)
         .replace("{number}", saved.invoiceNumber));
@@ -190,15 +305,35 @@ export function InvoiceEditor({
         window.setTimeout(() => router.replace(`/invoices/${encodeURIComponent(saved.id)}/edit?saved=1`), 0);
       }
     } catch {
-      setStatus("unavailable");
-      setStatusMessage(messages.unavailable);
+      const unresolved = isCreate && pendingCreateRef.current?.outcome !== "resolved"
+        ? pendingCreateRef.current
+        : null;
+      if (unresolved) {
+        pendingCreateRef.current = transitionPendingCreate(unresolved, "ambiguous");
+        setStatus("recovery");
+        setStatusMessage(messages.recoveryRequired);
+      } else {
+        setStatus("unavailable");
+        setStatusMessage(isRecovery ? messages.recoveredWithPendingChanges : messages.unavailable);
+      }
     } finally {
       saveInFlightRef.current = false;
     }
   }, [busy, focusFirstError, invoice, messages, mode, preview.fieldErrors, router]);
 
   const issue = useCallback(async () => {
-    if (issueInFlightRef.current || busy) return;
+    if (issueInFlightRef.current || busy || pendingCreateRef.current?.outcome === "ambiguous") return;
+    let requestId = issueRequestIdRef.current;
+    if (!requestId) {
+      try {
+        requestId = createSecureClientId();
+      } catch (error) {
+        if (!(error instanceof SecureRandomUnavailableError)) throw error;
+        setStatus("unavailable");
+        setStatusMessage(messages.secureRandomUnavailable);
+        return;
+      }
+    }
     issueInFlightRef.current = true;
     setShowIssueConfirm(false);
     setStatus("issuing");
@@ -207,7 +342,6 @@ export function InvoiceEditor({
     setWarnings([]);
     setCopyFallback("");
     focusIssueErrorsRef.current = false;
-    const requestId = issueRequestIdRef.current ?? newClientKey();
     issueRequestIdRef.current = requestId;
     try {
       const csrf = await getCsrfToken();
@@ -270,11 +404,11 @@ export function InvoiceEditor({
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
-      if (dirty) { event.preventDefault(); event.returnValue = messages.leaveWarning; }
+      if (shouldWarnOnLeave) { event.preventDefault(); event.returnValue = messages.leaveWarning; }
     };
     window.addEventListener("beforeunload", beforeUnload);
     return () => window.removeEventListener("beforeunload", beforeUnload);
-  }, [dirty, messages.leaveWarning]);
+  }, [messages.leaveWarning, shouldWarnOnLeave]);
 
   useEffect(() => {
     const shortcut = (event: globalThis.KeyboardEvent) => {
@@ -313,7 +447,7 @@ export function InvoiceEditor({
 
   function submit(event: FormEvent) { event.preventDefault(); void save(); }
   function confirmNavigation(event: MouseEvent<HTMLAnchorElement>) {
-    if (dirty && !window.confirm(messages.leaveWarning)) event.preventDefault();
+    if (shouldWarnOnLeave && !window.confirm(messages.leaveWarning)) event.preventDefault();
   }
   function updateItem(index: number, field: keyof Omit<EditorItem, "clientKey">, value: string) {
     updateInvoice((current) => ({ ...current, items: current.items.map((item, itemIndex) =>
@@ -335,17 +469,23 @@ export function InvoiceEditor({
   }
   function addItem() {
     if (invoice.items.length >= MAX_DRAFT_ITEMS) { setStatusMessage(messages.maxItems); setStatus("validation"); return; }
-    updateInvoice((current) => ({ ...current, items: [...current.items, emptyEditorItem(newClientKey())] }));
+    const clientKey = createEditorClientKey();
+    if (!clientKey) return;
+    updateInvoice((current) => ({ ...current, items: [...current.items, emptyEditorItem(clientKey)] }));
     requestAnimationFrame(() => document.getElementById(`item-${invoice.items.length}-productName`)?.focus());
   }
   function duplicateItem(index: number) {
     if (invoice.items.length >= MAX_DRAFT_ITEMS) { setStatusMessage(messages.maxItems); setStatus("validation"); return; }
-    updateInvoice((current) => ({ ...current, items: duplicateEditorItem(current.items, index, newClientKey()) }));
+    const clientKey = createEditorClientKey();
+    if (!clientKey) return;
+    updateInvoice((current) => ({ ...current, items: duplicateEditorItem(current.items, index, clientKey) }));
   }
   function deleteItem(index: number) {
     const item = invoice.items[index];
     if (item && editorItemHasData(item) && !window.confirm(messages.removeItemConfirm)) return;
-    updateInvoice((current) => ({ ...current, items: removeEditorItem(current.items, index, newClientKey()) }));
+    const clientKey = createEditorClientKey();
+    if (!clientKey) return;
+    updateInvoice((current) => ({ ...current, items: removeEditorItem(current.items, index, clientKey) }));
   }
   function onLastPriceKey(event: KeyboardEvent<HTMLInputElement>, index: number) {
     if (event.key === "Enter" && index === invoice.items.length - 1 && !event.nativeEvent.isComposing) {
@@ -488,8 +628,8 @@ export function InvoiceEditor({
 
       <aside className="invoice-summary" aria-labelledby="summary-title"><h2 id="summary-title">{messages.summary}</h2><dl><div><dt>{messages.subtotal}</dt><dd dir="ltr">{money(displayedPreview.subtotalMinor)}</dd></div><div className="invoice-summary__total"><dt>{messages.grandTotal}</dt><dd dir="ltr">{money(displayedPreview.grandTotalMinor)}</dd></div></dl><p>{messages.previewNotice}</p></aside>
       <div className="invoice-save-bar"><span aria-live="polite">{dirty ? messages.unsaved : status === "saved" || status === "issued" ? statusMessage : ""}</span>
-        <div className="invoice-save-bar__actions"><button type="submit" className="button-secondary" disabled={busy || status === "forbidden" || status === "notFound" || status === "malformed"}>{status === "saving" ? messages.saving : messages.saveDraft}</button>
-          <button type="button" ref={issueButtonRef} disabled={busy || status === "forbidden" || status === "notFound" || status === "malformed"} onClick={() => setShowIssueConfirm(true)}>{status === "issuing" ? messages.issuing : messages.issueInvoice}</button></div></div>
+        <div className="invoice-save-bar__actions"><button type="submit" className="button-secondary" disabled={busy || status === "forbidden" || status === "notFound" || status === "malformed"}>{status === "saving" ? messages.saving : status === "recovering" ? messages.recovering : status === "recovery" ? messages.recoverDraft : messages.saveDraft}</button>
+          <button type="button" ref={issueButtonRef} disabled={busy || status === "recovery" || status === "forbidden" || status === "notFound" || status === "malformed"} onClick={() => setShowIssueConfirm(true)}>{status === "issuing" ? messages.issuing : messages.issueInvoice}</button></div></div>
       </fieldset>
     </form>
     {showIssueConfirm && <div className="invoice-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) { setShowIssueConfirm(false); issueButtonRef.current?.focus(); } }}>

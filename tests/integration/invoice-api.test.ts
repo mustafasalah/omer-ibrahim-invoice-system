@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { GET as getCsrf } from "@/app/api/auth/csrf/route";
 import { POST } from "@/app/api/invoices/route";
+import { POST as REPLAY } from "@/app/api/invoices/replay/route";
 import { GET, PATCH } from "@/app/api/invoices/[id]/route";
 import { POST as ISSUE } from "@/app/api/invoices/[id]/issue/route";
 import type { DraftResult } from "@/domain/invoices/draft";
@@ -98,6 +99,32 @@ describe("invoice draft API", () => {
     expect((temporary.connection.client.prepare("select count(*) as count from invoices").get() as { count: bigint }).count).toBe(1n);
   });
 
+  it("never reflects or audits a raw idempotency key used as the client request ID", async () => {
+    temporary = createTemporaryDatabase(); globalThis.__oimsDatabaseConnection = temporary.connection;
+    const admin = await createTestAdmin(temporary.connection); const token = createSessionToken();
+    insertSession({ connection: temporary.connection, user: admin, token, now: new Date() });
+    const csrfData = await csrf(); const authCookie = `oims_session=${token}`;
+    const rawKey = "raw-shared-header-key-001";
+    const payload = { intent: "SAVE_DRAFT", invoice: { notes: "safe audit", items: [] } };
+
+    const createdResponse = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", payload,
+      authCookie, csrfData.token, csrfData.cookie, rawKey, rawKey));
+    expect(createdResponse.status).toBe(201);
+    const createdText = await createdResponse.text();
+    expect(createdText).not.toContain(rawKey);
+    expect(createdResponse.headers.get("x-request-id")).not.toBe(rawKey);
+    const storedRequestId = (temporary.connection.client.prepare(`select request_id as requestId from audit_logs
+      where event_type='INVOICE_CREATED'`).get() as { requestId: string }).requestId;
+    expect(storedRequestId).not.toBe(rawKey);
+    expect(storedRequestId).toMatch(/^[0-9a-f-]{36}$/u);
+
+    const conflictResponse = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+      intent: "SAVE_DRAFT", invoice: { notes: "different", items: [] },
+    }, authCookie, csrfData.token, csrfData.cookie, rawKey, rawKey));
+    expect(conflictResponse.status).toBe(409);
+    expect(await conflictResponse.text()).not.toContain(rawKey);
+  });
+
   it("ignores forged calculated fields and persists server-recalculated values (AT-CALC-010)", async () => {
     temporary = createTemporaryDatabase(); globalThis.__oimsDatabaseConnection = temporary.connection;
     const admin = await createTestAdmin(temporary.connection); const token = createSessionToken();
@@ -141,13 +168,13 @@ describe("invoice draft API", () => {
     expect(createdResponse.status).toBe(201);
     const created = await createdResponse.json() as DraftResult & { requestId: string };
     expect(created.requestId).toBe("invoice-api-test");
-    const lostResponseRetry = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", createBody,
+    const lostResponseRetry = await REPLAY(request("http://127.0.0.1:3000/api/invoices/replay", "POST", createBody,
       authCookie, csrfData.token, csrfData.cookie, "invoice-api-retry", "invoice-api-test-key"));
     expect(lostResponseRetry.status).toBe(201);
     const replayed = await lostResponseRetry.json() as DraftResult & { requestId: string };
     expect(replayed.requestId).toBe("invoice-api-retry");
     expect({ ...replayed, requestId: created.requestId }).toEqual(created);
-    const conflictingRetry = await POST(request("http://127.0.0.1:3000/api/invoices", "POST", {
+    const conflictingRetry = await REPLAY(request("http://127.0.0.1:3000/api/invoices/replay", "POST", {
       intent: "SAVE_DRAFT", invoice: { notes: "different payload", items: [] },
     }, authCookie, csrfData.token, csrfData.cookie, "invoice-api-conflict", "invoice-api-test-key"));
     expect(conflictingRetry.status).toBe(409);
@@ -183,6 +210,25 @@ describe("invoice draft API", () => {
     expect(stale.status).toBe(409);
     await expect(stale.json()).resolves.toMatchObject({ error: { code: apiErrorCodes.CONFLICT,
       fieldErrors: { rowVersion: "2" } } });
+    temporary.connection.client.prepare("update invoice_idempotency_records set created_at=?,expires_at=?")
+      .run("2020-01-01T00:00:00.000Z", "2020-01-08T00:00:00.000Z");
+    const expiredRetry = await REPLAY(request("http://127.0.0.1:3000/api/invoices/replay", "POST", createBody,
+      authCookie, csrfData.token, csrfData.cookie, "invoice-api-expired", "invoice-api-test-key"));
+    expect(expiredRetry.status).toBe(409);
+    const expiredBody = await expiredRetry.json();
+    expect(expiredBody).toMatchObject({ error: {
+      code: apiErrorCodes.IDEMPOTENCY_REPLAY_UNAVAILABLE,
+      fieldErrors: { idempotencyKey: "IDEMPOTENCY_REPLAY_UNAVAILABLE" },
+      requestId: "invoice-api-expired",
+    } });
+    expect(JSON.stringify(expiredBody)).not.toContain("invoice-api-test-key");
+    expect((temporary.connection.client.prepare("select count(*) as count from invoices").get() as {
+      count: bigint;
+    }).count).toBe(1n);
+    expect((temporary.connection.client.prepare(`select last_value as value from invoice_sequences
+      where sequence_key='invoice:2026'`).get() as { value: bigint }).value).toBe(1n);
+    expect((temporary.connection.client.prepare(`select count(*) as count from audit_logs
+      where event_type='INVOICE_CREATED'`).get() as { count: bigint }).count).toBe(1n);
   });
 
   it("returns 401 for protected reads without a valid session and safe 404/422 errors", async () => {

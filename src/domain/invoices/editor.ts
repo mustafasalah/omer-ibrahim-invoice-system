@@ -3,6 +3,7 @@ import { calculateInvoice } from "./calculator";
 import { inspectDecimalInput } from "./decimal";
 import { InvoiceCalculationError, type CurrencySnapshot } from "./contracts";
 import type { DraftInvoiceInput, InvoiceDraftDto, InvoiceEditorDefaults } from "./draft";
+import { canonicalDraftPayload } from "./pending-create";
 
 export type EditorItem = {
   clientKey: string;
@@ -200,7 +201,7 @@ export function draftToPlainText(state: InvoiceEditorState): string {
 }
 
 export function editorDraftFingerprint(state: InvoiceEditorState): string {
-  return JSON.stringify(toDraftInput(state));
+  return canonicalDraftPayload(toDraftInput(state));
 }
 
 export function reconcileSavedInvoice(

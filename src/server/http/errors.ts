@@ -12,6 +12,7 @@ export const apiErrorCodes = {
   INTERNAL_ERROR: "INTERNAL_ERROR",
   INVALID_IDEMPOTENCY_KEY: "INVALID_IDEMPOTENCY_KEY",
   IDEMPOTENCY_KEY_REUSED: "IDEMPOTENCY_KEY_REUSED",
+  IDEMPOTENCY_REPLAY_UNAVAILABLE: "IDEMPOTENCY_REPLAY_UNAVAILABLE",
   INVALID_CREDENTIALS: "INVALID_CREDENTIALS",
   LOGIN_RATE_LIMITED: "LOGIN_RATE_LIMITED",
   NOT_FOUND: "NOT_FOUND",
@@ -134,6 +135,15 @@ export function idempotencyKeyReusedError(): AppError {
     message: getMessages().errors.idempotencyKeyReused,
     status: 409,
     fieldErrors: { idempotencyKey: "IDEMPOTENCY_KEY_REUSED" },
+  });
+}
+
+export function idempotencyReplayUnavailableError(): AppError {
+  return new AppError({
+    code: apiErrorCodes.IDEMPOTENCY_REPLAY_UNAVAILABLE,
+    message: getMessages().errors.idempotencyReplayUnavailable,
+    status: 409,
+    fieldErrors: { idempotencyKey: "IDEMPOTENCY_REPLAY_UNAVAILABLE" },
   });
 }
 

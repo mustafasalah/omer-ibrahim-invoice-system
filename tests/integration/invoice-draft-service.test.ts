@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { createInvoiceDraft as createInvoiceDraftService, getInvoiceDraft, updateInvoiceDraft,
-  type InvoiceFaultPoint } from "@/server/invoices/service";
+import { createInvoiceDraft as createInvoiceDraftService, getInvoiceDraft, replayInvoiceDraftCreation,
+  updateInvoiceDraft, type InvoiceFaultPoint } from "@/server/invoices/service";
 import { apiErrorCodes } from "@/server/http/errors";
 import { fingerprintIdempotencyRequest, hashIdempotencyKey } from "@/server/idempotency/service";
 import { getSettings } from "@/server/settings/service";
@@ -101,6 +101,10 @@ describe("atomic invoice draft persistence", () => {
         "scope-employee", "scope-employee", "Scoped Employee", "EMPLOYEE", "unused", timestamp, timestamp,
       );
     const employee = { id: "scope-employee", displayName: "Scoped Employee", role: "EMPLOYEE" as const };
+    expect(() => replayInvoiceDraftCreation({ connection, actor: employee, input,
+      idempotencyKey, now })).toThrowError(expect.objectContaining({
+      code: apiErrorCodes.IDEMPOTENCY_REPLAY_UNAVAILABLE, status: 409,
+    }));
     const second = createInvoiceDraft({ connection, actor: employee, input, requestId: "scope-employee",
       idempotencyKey, now });
     expect(second.invoice.id).not.toBe(first.invoice.id);
@@ -112,6 +116,10 @@ describe("atomic invoice draft persistence", () => {
         "other-operation-record", actor.id, "OTHER_OPERATION", hashIdempotencyKey(operationKey),
         fingerprintIdempotencyRequest(input), 200, "{}", timestamp, "2026-09-03T08:00:00.000Z",
       );
+    expect(() => replayInvoiceDraftCreation({ connection, actor, input,
+      idempotencyKey: operationKey, now })).toThrowError(expect.objectContaining({
+      code: apiErrorCodes.IDEMPOTENCY_REPLAY_UNAVAILABLE, status: 409,
+    }));
     const third = createInvoiceDraft({ connection, actor, input, requestId: "scope-operation",
       idempotencyKey: operationKey, now });
     expect(third.invoice.id).not.toBe(first.invoice.id);
@@ -123,16 +131,30 @@ describe("atomic invoice draft persistence", () => {
       ]));
   });
 
-  it("replays for seven days, then expires the key and creates a fresh operation", async () => {
+  it("replays for seven days, fails closed during recovery, then permits an explicit fresh operation", async () => {
     const { connection, actor } = await setup();
     const idempotencyKey = "retention-window-key-01";
     const input = draft();
     const first = createInvoiceDraft({ connection, actor, input, requestId: "retention-first",
       idempotencyKey, now });
     const beforeExpiry = new Date(now.getTime() + (7 * 24 * 60 * 60 * 1_000) - 1);
-    expect(createInvoiceDraft({ connection, actor, input, requestId: "retention-replay",
+    expect(replayInvoiceDraftCreation({ connection, actor, input,
       idempotencyKey, now: beforeExpiry })).toEqual(first);
     const atExpiry = new Date(now.getTime() + (7 * 24 * 60 * 60 * 1_000));
+    for (const unavailableKey of [idempotencyKey, "missing-recovery-key-01"]) {
+      expect(() => replayInvoiceDraftCreation({ connection, actor, input,
+        idempotencyKey: unavailableKey, now: atExpiry })).toThrowError(expect.objectContaining({
+        code: apiErrorCodes.IDEMPOTENCY_REPLAY_UNAVAILABLE, status: 409,
+      }));
+    }
+    expect((connection.client.prepare("select count(*) as count from invoices").get() as { count: bigint }).count).toBe(1n);
+    expect((connection.client.prepare("select last_value as value from invoice_sequences where sequence_key='invoice:2026'")
+      .get() as { value: bigint }).value).toBe(1n);
+    expect((connection.client.prepare("select count(*) as count from audit_logs where event_type='INVOICE_CREATED'")
+      .get() as { count: bigint }).count).toBe(1n);
+    expect((connection.client.prepare("select count(*) as count from invoice_idempotency_records").get() as {
+      count: bigint;
+    }).count).toBe(1n);
     const replacement = createInvoiceDraft({ connection, actor, input, requestId: "retention-replacement",
       idempotencyKey, now: atExpiry });
     expect(replacement.invoice.id).not.toBe(first.invoice.id);

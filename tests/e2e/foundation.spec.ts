@@ -16,6 +16,11 @@ function isAllowedOfflineUrl(value: string): boolean {
   }
 }
 
+function requireCaptured<T>(value: T | null, label: string): T {
+  if (value === null || value === undefined) throw new Error(`${label} was not captured.`);
+  return value;
+}
+
 test.beforeEach(({ page }) => {
   const externalRequests: string[] = [];
   externalRequestsByPage.set(page, externalRequests);
@@ -88,6 +93,7 @@ test("setup → login → settings → create and edit draft → logout", async 
   await expect(page.getByRole("heading", { name: "فاتورة جديدة" })).toBeVisible();
   await expect(page.getByText("لم تُحفظ بعد", { exact: true })).toBeVisible();
   await expect(page.locator("main")).toHaveAttribute("data-row-version", "unsaved");
+  await page.waitForLoadState("networkidle");
 
   const issueButton = page.getByRole("button", { name: "إصدار الفاتورة" });
   await expect(issueButton).toBeEnabled();
@@ -151,6 +157,172 @@ test("setup → login → settings → create and edit draft → logout", async 
     totals: { grandTotalMinor: "0", remainingMinor: "0" }, printSnapshot: { capturedAt: expect.any(String) } } });
 
   await page.getByRole("link", { name: "العودة إلى لوحة التحكم" }).click();
+  await page.getByRole("link", { name: "إنشاء فاتورة جديدة" }).click();
+  await expect(page).toHaveURL(/\/invoices\/new$/);
+
+  const recoveryNotes = page.getByRole("textbox", { name: /^ملاحظات/u });
+  await recoveryNotes.fill("payload الأصلي");
+  let committedCreate: { invoice: { id: string; invoiceNumber: string; rowVersion: number } } | null = null;
+  let originalCreateBody = "";
+  let originalIdempotencyKey = "";
+  let originalRequestId = "";
+  await page.route("**/api/invoices", async (route) => {
+    const request = route.request();
+    if (request.method() !== "POST"
+      || (request.postDataJSON() as { intent?: string }).intent !== "SAVE_DRAFT") {
+      await route.continue();
+      return;
+    }
+    originalCreateBody = request.postData() ?? "";
+    originalIdempotencyKey = request.headers()["idempotency-key"] ?? "";
+    originalRequestId = request.headers()["x-request-id"] ?? "";
+    const committedResponse = await route.fetch();
+    expect(committedResponse.status()).toBe(201);
+    committedCreate = await committedResponse.json() as typeof committedCreate;
+    await route.abort("failed");
+  }, { times: 1 });
+
+  await page.getByRole("button", { name: "حفظ كمسودة" }).click();
+  const recoverButton = page.getByRole("button", { name: "استعادة نتيجة الحفظ السابق" });
+  await expect(recoverButton).toBeVisible();
+  const recoveredCommitted = requireCaptured<{ invoice: { id: string; invoiceNumber: string; rowVersion: number } }>(
+    committedCreate,
+    "committed create response",
+  );
+  await expect(page.getByText(/نتيجة محاولة الحفظ السابقة غير معروفة/u)).toBeVisible();
+  await expect(page.getByRole("button", { name: "إصدار الفاتورة" })).toBeDisabled();
+  await recoveryNotes.fill("x".repeat(2_001));
+  await expect(page.getByText(/نتيجة محاولة الحفظ السابقة غير معروفة/u)).toBeVisible();
+
+  const reusedAttemptPromise = page.waitForRequest((request) => request.url().endsWith("/api/invoices/replay")
+    && request.method() === "POST"
+    && (request.postDataJSON() as { intent?: string }).intent === "SAVE_DRAFT");
+  await page.route("**/api/invoices/replay", async (route) => {
+    await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({
+      error: {
+        code: "IDEMPOTENCY_KEY_REUSED",
+        message: "The idempotency key was already used.",
+        fieldErrors: { idempotencyKey: "IDEMPOTENCY_KEY_REUSED" },
+        requestId: "reused-recovery",
+      },
+    }) });
+  }, { times: 1 });
+  await recoverButton.click();
+  const reusedAttempt = await reusedAttemptPromise;
+  expect(reusedAttempt.postData()).toBe(originalCreateBody);
+  expect(reusedAttempt.headers()["idempotency-key"]).toBe(originalIdempotencyKey);
+  await expect(recoverButton).toBeVisible();
+  await expect(recoveryNotes).toHaveValue("x".repeat(2_001));
+
+  const inconclusiveAttemptPromise = page.waitForRequest((request) => request.url().endsWith("/api/invoices/replay")
+    && request.method() === "POST"
+    && (request.postDataJSON() as { intent?: string }).intent === "SAVE_DRAFT");
+  await page.route("**/api/invoices/replay", async (route) => {
+    await route.fulfill({ status: 422, contentType: "application/json", body: JSON.stringify({
+      error: {
+        code: "VALIDATION_ERROR",
+        message: "The recovery result could not be confirmed.",
+        fieldErrors: { invoice: "INVALID_VALUE" },
+        requestId: "inconclusive-recovery",
+      },
+    }) });
+  }, { times: 1 });
+  await recoverButton.click();
+  const inconclusiveAttempt = await inconclusiveAttemptPromise;
+  expect(inconclusiveAttempt.postData()).toBe(originalCreateBody);
+  expect(inconclusiveAttempt.headers()["idempotency-key"]).toBe(originalIdempotencyKey);
+  await expect(recoverButton).toBeVisible();
+  await expect(recoveryNotes).toHaveValue("x".repeat(2_001));
+
+  await recoveryNotes.fill("أحدث تعديل بعد ضياع الرد");
+
+  const replayRequestPromise = page.waitForRequest((request) => request.url().endsWith("/api/invoices/replay")
+    && request.method() === "POST"
+    && (request.postDataJSON() as { intent?: string }).intent === "SAVE_DRAFT");
+  const recoveredPatchPromise = page.waitForRequest((request) => request.method() === "PATCH"
+    && request.url().includes(`/api/invoices/${recoveredCommitted.invoice.id}`));
+  await recoverButton.click();
+  await expect(page.getByRole("button", { name: "جارٍ استعادة نتيجة الحفظ السابق…" })).toBeDisabled();
+  const replayRequest = await replayRequestPromise;
+  expect(replayRequest.postData()).toBe(originalCreateBody);
+  expect(replayRequest.headers()["idempotency-key"]).toBe(originalIdempotencyKey);
+  expect(replayRequest.headers()["x-request-id"]).not.toBe(originalRequestId);
+  const recoveredPatch = await recoveredPatchPromise;
+  expect(recoveredPatch.postDataJSON()).toMatchObject({
+    rowVersion: recoveredCommitted.invoice.rowVersion,
+    invoice: { notes: "أحدث تعديل بعد ضياع الرد" },
+  });
+  await expect(page).toHaveURL(new RegExp(`/invoices/${recoveredCommitted.invoice.id}/edit(?:\\?saved=1)?$`, "u"));
+  const recoveredResponse = await page.request.get(`/api/invoices/${recoveredCommitted.invoice.id}`);
+  await expect(recoveredResponse.json()).resolves.toMatchObject({
+    invoice: {
+      id: recoveredCommitted.invoice.id,
+      invoiceNumber: recoveredCommitted.invoice.invoiceNumber,
+      rowVersion: recoveredCommitted.invoice.rowVersion + 1,
+      notes: "أحدث تعديل بعد ضياع الرد",
+    },
+  });
+
+  await page.getByRole("link", { name: "لوحة التحكم", exact: true }).click();
+  await page.getByRole("link", { name: "إنشاء فاتورة جديدة" }).click();
+  await expect(page).toHaveURL(/\/invoices\/new$/);
+
+  const conflictRecoveryNotes = page.getByRole("textbox", { name: /^ملاحظات/u });
+  await conflictRecoveryNotes.fill("payload أصلي للتعارض");
+  let conflictCommitted: { invoice: { id: string; rowVersion: number } } | null = null;
+  let conflictOriginalBody = "";
+  let conflictIdempotencyKey = "";
+  await page.route("**/api/invoices", async (route) => {
+    const request = route.request();
+    if (request.method() !== "POST"
+      || (request.postDataJSON() as { intent?: string }).intent !== "SAVE_DRAFT") {
+      await route.continue();
+      return;
+    }
+    conflictOriginalBody = request.postData() ?? "";
+    conflictIdempotencyKey = request.headers()["idempotency-key"] ?? "";
+    const committedResponse = await route.fetch();
+    expect(committedResponse.status()).toBe(201);
+    conflictCommitted = await committedResponse.json() as typeof conflictCommitted;
+    await route.abort("failed");
+  }, { times: 1 });
+
+  await page.getByRole("button", { name: "حفظ كمسودة" }).click();
+  const conflictRecoverButton = page.getByRole("button", { name: "استعادة نتيجة الحفظ السابق" });
+  await expect(conflictRecoverButton).toBeVisible();
+  const capturedConflictCreate = requireCaptured<{ invoice: { id: string; rowVersion: number } }>(
+    conflictCommitted,
+    "conflict create response",
+  );
+  await conflictRecoveryNotes.fill("مدخلات محلية محفوظة عند 409");
+  const conflictReplayPromise = page.waitForRequest((request) => request.url().endsWith("/api/invoices/replay")
+    && request.method() === "POST"
+    && (request.postDataJSON() as { intent?: string }).intent === "SAVE_DRAFT");
+  const conflictPatchPromise = page.waitForRequest((request) => request.method() === "PATCH"
+    && request.url().includes(`/api/invoices/${capturedConflictCreate.invoice.id}`));
+  await page.route(`**/api/invoices/${capturedConflictCreate.invoice.id}`, async (route) => {
+    await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({
+      error: { code: "CONFLICT", message: "توجد نسخة أحدث.", fieldErrors: { rowVersion: "CONFLICT" }, requestId: "recovery-conflict" },
+    }) });
+  }, { times: 1 });
+  await conflictRecoverButton.click();
+  const conflictReplay = await conflictReplayPromise;
+  expect(conflictReplay.postData()).toBe(conflictOriginalBody);
+  expect(conflictReplay.headers()["idempotency-key"]).toBe(conflictIdempotencyKey);
+  const conflictPatch = await conflictPatchPromise;
+  expect(conflictPatch.postDataJSON()).toMatchObject({
+    rowVersion: capturedConflictCreate.invoice.rowVersion,
+    invoice: { notes: "مدخلات محلية محفوظة عند 409" },
+  });
+  const recoveryConflictPanel = page.getByRole("alertdialog");
+  await expect(recoveryConflictPanel).toBeFocused();
+  await expect(conflictRecoveryNotes).toHaveValue("مدخلات محلية محفوظة عند 409");
+  await expect(page.locator("main")).toHaveAttribute("data-row-version", String(capturedConflictCreate.invoice.rowVersion));
+  page.once("dialog", (prompt) => void prompt.accept());
+  await recoveryConflictPanel.getByRole("button", { name: "تحميل أحدث نسخة" }).click();
+  await expect(recoveryConflictPanel).toBeHidden();
+
+  await page.getByRole("link", { name: "لوحة التحكم", exact: true }).click();
   await page.getByRole("link", { name: "إنشاء فاتورة جديدة" }).click();
   await expect(page).toHaveURL(/\/invoices\/new$/);
 
@@ -304,5 +476,5 @@ test("setup → login → settings → create and edit draft → logout", async 
   const healthResponse = await request.get("/api/health", { headers: { "x-request-id": "e2e-health" } });
   expect(healthResponse.ok()).toBe(true);
   expect(healthResponse.headers()["x-request-id"]).toBe("e2e-health");
-  await expect(healthResponse.json()).resolves.toMatchObject({ status: "ok", checks: { database: "ok", schemaVersion: 2 }, requestId: "e2e-health" });
+  await expect(healthResponse.json()).resolves.toMatchObject({ status: "ok", checks: { database: "ok", schemaVersion: 3 }, requestId: "e2e-health" });
 });
